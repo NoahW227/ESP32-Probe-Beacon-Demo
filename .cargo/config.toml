@@ -1,0 +1,24 @@
+# TARGET SELECTION
+# ----------------
+# `target` and `MCU` must always agree. The attached board identified itself as
+# a classic ESP32 (esp32 rev v3.1, WiFi+BT, 4MB flash), not an ESP32-S3.
+#
+# To switch to an ESP32-S3 later, change BOTH lines to the s3 variants:
+#   target = "xtensa-esp32s3-espidf"   /   MCU = "esp32s3"
+# and re-enable the USB Serial/JTAG console in sdkconfig.defaults.
+# Both targets are already installed, so no espup re-run is needed.
+
+[build]
+target = "xtensa-esp32-espidf"
+
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor --monitor-baud 921600"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32"
+ESP_IDF_VERSION = "v5.2.2"

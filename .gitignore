@@ -1,0 +1,7 @@
+/captures
+/target
+/workspace
+/.toolchain
+/.embuild
+sdkconfig.defaults.esp32s3
+sdkconfig

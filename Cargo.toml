@@ -1,0 +1,29 @@
+[package]
+name = "wardrive-fw"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.82"
+
+[[bin]]
+name = "wardrive-fw"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[features]
+default = ["std", "esp-idf-svc/native"]
+std = ["esp-idf-svc/binstart", "esp-idf-svc/std"]
+
+[dependencies]
+log = "0.4"
+anyhow = "1"
+esp-idf-svc = { version = "0.52.1", default-features = false }
+
+[build-dependencies]
+embuild = "0.33"
