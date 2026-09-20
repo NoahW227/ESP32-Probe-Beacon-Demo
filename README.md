@@ -76,6 +76,7 @@ followed by a separate `cat` races and yields corrupt data. Hold the fd open:
     ./host/host.py                                    # live from the board
     ./host/host.py --replay captures/demo-fallback.jsonl
     ./host/host.py --watch "Smith Family WiFi"        # pin a planted SSID
+    ./host/host.py --sort count                       # probes by request count
 
 Then open <http://127.0.0.1:8000/>.
 
@@ -84,9 +85,20 @@ after `termios` sets the line discipline it reads as a plain file, which is why
 `pyserial` isn't needed.
 
 Layout: access points by signal strength (the room's own AP sorts to the top),
-probe requests as a live feed, and a pinned panel of the network names devices
-are asking for. That last panel is the point of the demo and never scrolls, so
-a rare named probe can't vanish mid-sentence.
+probe requests one row per (device, network), and a pinned panel of the network
+names devices are asking for. That last panel is the point of the demo and
+never scrolls, so a rare named probe can't vanish mid-sentence.
+
+Probe rows are deduplicated by (MAC, SSID) — a device scanning the band emits
+the same wildcard probe many times a second, and appending each one lets it
+occupy every visible row. The `Seen` column shows how many times the pair was
+observed, and the signal shown is the strongest sample, not the latest, which
+would jitter a few dB every frame.
+
+`--sort rssi` (default) puts the physically closest devices first and matches
+the beacon column. `--sort count` puts the chattiest first — useful for making
+the "look how often this thing transmits" point, but it pins high-count devices
+to the top so newly seen names sink.
 
 Keys: `M` reveals full MACs, `+`/`-` resize for the projector.
 

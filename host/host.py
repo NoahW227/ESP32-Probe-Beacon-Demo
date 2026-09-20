@@ -67,8 +67,9 @@ def open_serial(path, baud):
 class Store:
     """Everything the board has told us, plus the derived view the page needs."""
 
-    def __init__(self, watch=()):
+    def __init__(self, watch=(), sort="rssi"):
         self.lock = threading.Lock()
+        self.sort = sort
         self.aps = {}                 # bssid -> latest beacon record
         self.probes = {}              # (mac, ssid) -> one row, not one per frame
         self.named = {}               # ssid -> aggregate of named probe requests
@@ -163,11 +164,13 @@ class Store:
             beacons = sorted(self.aps.values(), key=lambda a: -a["rssi"])[:ROWS]
             beacons = [dict(b, label=mac_label(b["bssid"])) for b in beacons]
 
-            # One row per (MAC, SSID), most recently heard first. Deliberately
-            # not ranked named-first: the wildcard traffic is most of what is
-            # in the air and showing it is the point. Named probes persist in
-            # the leaked-networks panel regardless, so nothing is lost here.
-            feed = sorted(self.probes.values(), key=lambda e: -e["last"])[:ROWS]
+            # One row per (MAC, SSID). Sort order is a display choice, so it
+            # is stated in the column heading rather than left implicit.
+            if self.sort == "count":
+                key = lambda e: (-e["count"], -e["last"])
+            else:                                    # "rssi"
+                key = lambda e: (-e["rssi"], -e["last"])
+            feed = sorted(self.probes.values(), key=key)[:ROWS]
             feed = [
                 {k: e[k] for k in ("mac", "label", "kind", "ssid", "named", "rssi", "ch", "rnd", "count")}
                 for e in feed
@@ -186,6 +189,7 @@ class Store:
             stale = time.time() - self.last_rx if self.last_rx else 999
             return {
                 "mode": mode,
+                "sort": self.sort,
                 "stale": stale > 5,
                 "beacons": beacons,
                 "probes": feed,
@@ -235,7 +239,7 @@ def pump_replay(path, store, loop=True):
             store.ingest(rec)
         if not loop:
             return
-        store.__init__(watch=store.watch)   # clear between loops
+        store.__init__(watch=store.watch, sort=store.sort)   # clear between loops
 
 
 # --- http -------------------------------------------------------------------
@@ -300,9 +304,11 @@ def main():
     ap.add_argument("--http-port", type=int, default=8000)
     ap.add_argument("--watch", action="append", default=[],
                     help="pin this SSID to the top when seen (repeatable)")
+    ap.add_argument("--sort", choices=("rssi", "count"), default="rssi",
+                    help="probe column order: strongest signal (default) or most requests")
     args = ap.parse_args()
 
-    store = Store(watch=args.watch)
+    store = Store(watch=args.watch, sort=args.sort)
     mode = "replay" if args.replay else "live"
 
     if args.replay:
@@ -319,6 +325,7 @@ def main():
     src_desc = args.replay if args.replay else f"{args.port} @ {args.baud}"
     print(f"  source : {src_desc}  ({mode})")
     print(f"  display: {url}")
+    print(f"  probes sorted by: {args.sort}")
     print("  press M in the browser to reveal full MACs, +/- to resize")
     try:
         srv.serve_forever()
