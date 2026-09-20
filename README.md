@@ -102,6 +102,22 @@ to the top so newly seen names sink.
 
 Keys: `M` reveals full MACs, `+`/`-` resize for the projector.
 
+### Themes
+
+`index.html` is a period-accurate 2005 layout — Windows 98 title bar, tiled
+background, `<marquee>`, beveled tables, LCD hit counters, IE6 status bar.
+`index_old.html` is the original dark projector theme. Swap either way:
+
+    cp host/index_old.html host/index.html     # dark theme
+    cp host/index_2005.html host/index.html    # 2005 theme
+
+Both render from the same `render(d)` data, so `host.py` and `oui.py` are
+identical for either (`host_old.py` / `oui_old.py` are byte-identical copies
+kept alongside).
+
+The 2005 theme uses ~11px Verdana, which is much smaller than the dark theme.
+Press `+` a few times before presenting and check legibility from the back.
+
 MACs are redacted by default to `Vendor:hash` (`Sony:cc33`). Colour encodes
 what kind of address it is, and the label agrees with it:
 
