@@ -19,7 +19,6 @@ import sys
 import termios
 import threading
 import time
-from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,7 +28,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # How many rows each column shows. The store keeps everything; this is display.
 ROWS = 15
-PROBE_FEED = 400
+# Distinct (MAC, SSID) pairs retained. One scanning device can emit many frames
+# per second, so the feed is keyed rather than appended.
+PROBE_KEEP = 600
+# Drop a pair we have not heard from in this long, so the feed stays current.
+PROBE_STALE_S = 180
 SNAPSHOT_HZ = 2
 
 
@@ -67,7 +70,7 @@ class Store:
     def __init__(self, watch=()):
         self.lock = threading.Lock()
         self.aps = {}                 # bssid -> latest beacon record
-        self.probes = deque(maxlen=PROBE_FEED)
+        self.probes = {}              # (mac, ssid) -> one row, not one per frame
         self.named = {}               # ssid -> aggregate of named probe requests
         self.devices = set()          # every probing MAC ever seen
         self.watch = {w.lower() for w in watch}
@@ -85,10 +88,8 @@ class Store:
             if kind == "beacon":
                 self.aps[rec["bssid"]] = rec
             elif kind == "probe_req":
-                mac = rec["mac"]
-                self.devices.add(mac)
-                rec = dict(rec, label=mac_label(mac), seen=time.time())
-                self.probes.append(rec)
+                self.devices.add(rec["mac"])
+                self._add_probe(rec)
                 if rec.get("named") and rec.get("ssid"):
                     self._add_named(rec)
             elif kind == "probe_resp":
@@ -100,6 +101,39 @@ class Store:
             elif kind == "stat":
                 self._update_rate(rec)
                 self.stat = rec
+
+    def _add_probe(self, rec):
+        """Collapse to one row per (MAC, SSID).
+
+        A device scanning the band emits the same wildcard probe many times a
+        second. Appending each one lets a single device occupy every visible
+        row and push out the rare named probes that matter.
+        """
+        mac, ssid = rec["mac"], rec.get("ssid", "")
+        now = time.time()
+        e = self.probes.get((mac, ssid))
+        if e is None:
+            e = {
+                "mac": mac, "label": mac_label(mac), "ssid": ssid,
+                "named": bool(rec.get("named")), "rnd": bool(rec.get("rnd")),
+                "count": 0, "rssi": -127,
+            }
+            self.probes[(mac, ssid)] = e
+        e["count"] += 1
+        # Strongest sample, not the latest: a live-updating value jitters by a
+        # few dB every frame, which reads as noise on a projector.
+        e["rssi"] = max(e["rssi"], rec["rssi"])
+        e["ch"] = rec["ch"]
+        e["last"] = now
+
+        if len(self.probes) > PROBE_KEEP:
+            cutoff = now - PROBE_STALE_S
+            self.probes = {
+                k: v for k, v in self.probes.items() if v["last"] >= cutoff
+            }
+            if len(self.probes) > PROBE_KEEP:   # still over: drop oldest
+                keep = sorted(self.probes.items(), key=lambda kv: -kv[1]["last"])
+                self.probes = dict(keep[:PROBE_KEEP])
 
     def _add_named(self, rec):
         e = self.named.setdefault(
@@ -128,10 +162,14 @@ class Store:
             beacons = sorted(self.aps.values(), key=lambda a: -a["rssi"])[:ROWS]
             beacons = [dict(b, label=mac_label(b["bssid"])) for b in beacons]
 
-            # Probes by recency: motion is the point, it reads as "right now".
+            # One row per (MAC, SSID), most recently heard first. Deliberately
+            # not ranked named-first: the wildcard traffic is most of what is
+            # in the air and showing it is the point. Named probes persist in
+            # the leaked-networks panel regardless, so nothing is lost here.
+            feed = sorted(self.probes.values(), key=lambda e: -e["last"])[:ROWS]
             feed = [
-                {k: p[k] for k in ("mac", "label", "ssid", "named", "rssi", "ch", "rnd")}
-                for p in list(self.probes)[-ROWS:][::-1]
+                {k: e[k] for k in ("mac", "label", "ssid", "named", "rssi", "ch", "rnd", "count")}
+                for e in feed
             ]
 
             named = sorted(

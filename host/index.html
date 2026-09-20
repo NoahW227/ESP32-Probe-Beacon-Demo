@@ -35,14 +35,16 @@
     color: var(--dim); border-bottom: 1px solid var(--line); text-transform: uppercase;
   }
   .rows { flex: 1; overflow: hidden; padding: .3rem 0;
-          display: flex; flex-direction: column; justify-content: space-evenly; }
+          display: flex; flex-direction: column; justify-content: flex-start; }
   .row {
-    display: grid; align-items: baseline; gap: .9rem;
+    display: grid; align-items: center; gap: .9rem;
     padding: .15rem 1rem; white-space: nowrap;
+    min-height: 2.75rem;          /* fills the panel at 15 rows, stacks when few */
   }
+  #namedPanel .row { min-height: 2rem; }
   #namedPanel .rows { justify-content: flex-start; }
   #beacons .row { grid-template-columns: 4.2rem minmax(0,1fr) 4.5rem 3.5rem; }
-  #probes  .row { grid-template-columns: 11rem 1fr 4.2rem; }
+  #probes  .row { grid-template-columns: 11rem minmax(0,1fr) 4rem 4.2rem; }
   #named   .row { grid-template-columns: 1fr 9rem 14rem; }
   .rssi { text-align: right; font-variant-numeric: tabular-nums; }
   .s0 { color: var(--accent); } .s1 { color: #a3e635; }
@@ -50,6 +52,8 @@
   .ssid { overflow: hidden; text-overflow: ellipsis; }
   .hidden-ap, .wildcard { color: var(--dim); font-style: italic; }
   .sec { color: var(--dim); font-size: .85rem; }
+  .count { color: var(--dim); font-size: .85rem; text-align: right;
+           font-variant-numeric: tabular-nums; }
   .ch  { color: var(--dim); font-size: .85rem; text-align: right; }
   .mac { color: #7dd3fc; }
   .mac.rnd { color: #c084fc; }
@@ -79,7 +83,7 @@
     <div class="rows"></div>
   </section>
   <section id="probes">
-    <h2>Probe requests &mdash; live</h2>
+    <h2>Probe requests &mdash; one row per device + network</h2>
     <div class="rows"></div>
   </section>
 </main>
@@ -133,6 +137,7 @@
       <div class="row">
         <span class="mac ${p.rnd ? 'rnd' : ''}">${esc(revealMacs ? p.mac : p.label)}</span>
         <span class="ssid ${p.named ? '' : 'wildcard'}">${p.named ? esc(p.ssid) : '(any network)'}</span>
+        <span class="count">${p.count > 1 ? p.count + '\u00d7' : ''}</span>
         <span class="rssi ${band(p.rssi)}">${p.rssi}</span>
       </div>`).join('') || '<div class="empty">waiting for probes…</div>';
 
