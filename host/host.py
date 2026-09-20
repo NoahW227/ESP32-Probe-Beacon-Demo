@@ -22,7 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from oui import label as mac_label
+from oui import SOURCE as OUI_SOURCE, describe as mac_describe, label as mac_label
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -113,8 +113,9 @@ class Store:
         now = time.time()
         e = self.probes.get((mac, ssid))
         if e is None:
+            lab, kind = mac_describe(mac)
             e = {
-                "mac": mac, "label": mac_label(mac), "ssid": ssid,
+                "mac": mac, "label": lab, "kind": kind, "ssid": ssid,
                 "named": bool(rec.get("named")), "rnd": bool(rec.get("rnd")),
                 "count": 0, "rssi": -127,
             }
@@ -168,7 +169,7 @@ class Store:
             # the leaked-networks panel regardless, so nothing is lost here.
             feed = sorted(self.probes.values(), key=lambda e: -e["last"])[:ROWS]
             feed = [
-                {k: e[k] for k in ("mac", "label", "ssid", "named", "rssi", "ch", "rnd", "count")}
+                {k: e[k] for k in ("mac", "label", "kind", "ssid", "named", "rssi", "ch", "rnd", "count")}
                 for e in feed
             ]
 

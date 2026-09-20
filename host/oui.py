@@ -1,64 +1,103 @@
-"""A small curated OUI -> vendor table.
+"""MAC address -> display label.
 
-This is deliberately not the full IEEE registry: it covers the vendors likely
-to show up in a room, and anything unknown falls back to displaying the OUI
-prefix itself. That still redacts the device-specific half of the address, so
-correctness never depends on this table being complete.
+Two things are being distinguished, and it is worth keeping them straight:
+
+* Whether the address is *randomized*. A locally-administered address (bit 1
+  of the first octet) is invented by the device to resist tracking, so there
+  is no manufacturer behind it to name.
+* Who made the device, for real hardware addresses. That comes from the first
+  three octets, the OUI, which IEEE assigns to a manufacturer.
+
+The vendor table is the system IEEE registry (hwdata, ~40k entries) when it is
+present, falling back to a small built-in list otherwise. Anything still
+unresolved shows the bare OUI - the device-specific half stays hidden either
+way, so redaction never depends on the lookup succeeding.
 """
 
-OUI = {
-    # Espressif (this board is d4:e9:f4)
-    "24:0a:c4": "Espressif", "30:ae:a4": "Espressif", "3c:71:bf": "Espressif",
-    "7c:9e:bd": "Espressif", "84:cc:a8": "Espressif", "a4:cf:12": "Espressif",
-    "b4:e6:2d": "Espressif", "c4:4f:33": "Espressif", "d4:e9:f4": "Espressif",
-    # Apple
-    "00:0a:95": "Apple", "00:1b:63": "Apple", "00:25:00": "Apple",
-    "3c:07:54": "Apple", "40:a6:d9": "Apple", "68:a8:6d": "Apple",
-    "8c:58:77": "Apple", "a4:83:e7": "Apple", "ac:bc:32": "Apple",
-    "b8:e8:56": "Apple", "d0:81:7a": "Apple", "f0:18:98": "Apple",
-    # Samsung
-    "00:15:99": "Samsung", "08:37:3d": "Samsung", "1c:5a:3e": "Samsung",
-    "34:23:ba": "Samsung", "5c:0a:5b": "Samsung", "78:47:1d": "Samsung",
-    "8c:77:12": "Samsung", "bc:20:a4": "Samsung", "cc:07:ab": "Samsung",
-    # Intel
-    "00:1b:21": "Intel", "00:24:d7": "Intel", "34:13:e8": "Intel",
-    "3c:a9:f4": "Intel", "7c:7a:91": "Intel", "94:65:9c": "Intel",
-    "a0:88:69": "Intel", "e4:a4:71": "Intel",
-    # HP (30:8d:99 seen locally as an Officejet)
-    "00:1f:29": "HP", "30:8d:99": "HP", "3c:d9:2b": "HP",
-    "70:5a:0f": "HP", "94:57:a5": "HP",
-    # Google / Amazon / Roku / Sonos
-    "3c:5a:b4": "Google", "54:60:09": "Google", "94:eb:2c": "Google",
-    "f4:f5:d8": "Google", "44:65:0d": "Amazon", "68:37:e9": "Amazon",
-    "74:c2:46": "Amazon", "f0:27:2d": "Amazon", "b0:a7:37": "Roku",
-    "cc:6d:a0": "Roku", "d8:31:34": "Roku", "00:0e:58": "Sonos",
-    "34:7e:5c": "Sonos", "48:a6:b8": "Sonos", "5c:aa:fd": "Sonos",
-    # Microsoft / networking gear
-    "00:12:5a": "Microsoft", "28:18:78": "Microsoft", "7c:1e:52": "Microsoft",
-    "00:18:0a": "Cisco", "e0:cb:bc": "Cisco", "88:15:44": "Cisco",
-    "04:18:d6": "Ubiquiti", "24:a4:3c": "Ubiquiti", "74:83:c2": "Ubiquiti",
-    "78:8a:20": "Ubiquiti", "fc:ec:da": "Ubiquiti",
-    "14:cc:20": "TP-Link", "50:c7:bf": "TP-Link", "60:e3:27": "TP-Link",
-    "a4:2b:b0": "TP-Link", "ec:08:6b": "TP-Link",
-    "00:14:6c": "Netgear", "20:4e:7f": "Netgear", "2c:30:33": "Netgear",
-    "00:1b:fc": "ASUS", "2c:fd:a1": "ASUS", "38:d5:47": "ASUS",
-    "50:46:5d": "ASUS", "3c:7a:8a": "Arris", "94:87:7c": "Arris",
+import hashlib
+import re
+
+SYSTEM_DBS = (
+    "/usr/share/hwdata/oui.txt",
+    "/usr/share/ieee-data/oui.txt",
+    "/var/lib/ieee-data/oui.txt",
+)
+
+# Used only if no system registry is installed.
+FALLBACK = {
+    "d4:e9:f4": "Espressif", "24:0a:c4": "Espressif", "a4:cf:12": "Espressif",
+    "00:0a:95": "Apple", "a4:83:e7": "Apple", "ac:bc:32": "Apple",
+    "08:37:3d": "Samsung", "34:23:ba": "Samsung", "cc:07:ab": "Samsung",
+    "3c:a9:f4": "Intel", "94:65:9c": "Intel", "e4:a4:71": "Intel",
+    "30:8d:99": "HP", "3c:d9:2b": "HP", "b0:a7:37": "Roku",
+    "3c:5a:b4": "Google", "44:65:0d": "Amazon", "00:0e:58": "Sonos",
 }
+
+# Legal boilerplate that adds nothing on a projector.
+_NOISE = re.compile(
+    r"\b(inc|inc\.|incorporated|corp|corp\.|corporate|corporation|co|co\.|company|"
+    r"ltd|ltd\.|limited|llc|l\.l\.c\.|gmbh|ag|a/s|b\.v\.|s\.a\.|s\.p\.a\.|plc|"
+    r"technologies|technology|electronics|electronic|communications|computer|"
+    r"international|holdings|group|industrial|systems)\b",
+    re.I,
+)
+
+
+def _shorten(name: str, cap: int = 16) -> str:
+    name = _NOISE.sub("", name)
+    name = re.sub(r"[,&]", " ", name)
+    name = " ".join(name.split()).strip(" .-")
+    if len(name) > cap:                 # still long: the first word carries it
+        name = name.split(" ")[0][:cap]
+    return name or "unknown"
+
+
+def _load():
+    for path in SYSTEM_DBS:
+        try:
+            fh = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        table = {}
+        with fh:
+            for line in fh:
+                m = re.match(
+                    r"^([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})\s+\(hex\)\s+(.+?)\s*$",
+                    line,
+                )
+                if m:
+                    key = f"{m.group(1)}:{m.group(2)}:{m.group(3)}".lower()
+                    table[key] = _shorten(m.group(4))
+        if table:
+            return table, path
+    return {k: _shorten(v) for k, v in FALLBACK.items()}, "built-in"
+
+
+OUI, SOURCE = _load()
+
+
+def describe(mac: str):
+    """Return (display_label, kind).
+
+    kind is 'random' for a randomized address, 'vendor' when the manufacturer
+    resolved, and 'unknown' when it did not - so the page can show an
+    unresolved vendor as a gap in the lookup rather than a third category of
+    address.
+    """
+    parts = mac.split(":")
+    if len(parts) != 6:
+        return mac, "unknown"
+    tail = hashlib.sha256(mac.encode()).hexdigest()[:4]
+
+    if int(parts[0], 16) & 0x02:        # locally administered == randomized
+        return f"(random):{tail}", "random"
+
+    oui = ":".join(parts[:3]).lower()
+    vendor = OUI.get(oui)
+    if vendor:
+        return f"{vendor}:{tail}", "vendor"
+    return f"{oui}:{tail}", "unknown"
 
 
 def label(mac: str) -> str:
-    """Redacted display form: vendor (or OUI) plus a 4-hex-char digest.
-
-    A locally-administered address is a randomized MAC, so there is no real
-    vendor to name - say so instead of implying one.
-    """
-    import hashlib
-
-    parts = mac.split(":")
-    if len(parts) != 6:
-        return mac
-    oui = ":".join(parts[:3]).lower()
-    randomized = bool(int(parts[0], 16) & 0x02)
-    who = "(random)" if randomized else OUI.get(oui, oui)
-    tail = hashlib.sha256(mac.encode()).hexdigest()[:4]
-    return f"{who}:{tail}"
+    return describe(mac)[0]

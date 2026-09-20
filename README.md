@@ -90,9 +90,18 @@ a rare named probe can't vanish mid-sentence.
 
 Keys: `M` reveals full MACs, `+`/`-` resize for the projector.
 
-MACs are redacted by default to `Vendor:hash` (`Apple:3e6a`), or `(random):…`
-when the locally-administered bit is set. Unknown OUIs show the bare prefix, so
-nothing depends on the vendor table being complete.
+MACs are redacted by default to `Vendor:hash` (`Sony:cc33`). Colour encodes
+what kind of address it is, and the label agrees with it:
+
+| shown | colour | meaning |
+| --- | --- | --- |
+| `Sony:cc33` | blue | real hardware address, manufacturer known |
+| `(random):a471` | purple | locally-administered bit set — the device made this address up, so there is no manufacturer to name |
+| `38:8d:3d:fd13` | dim blue | real address, but the OUI is not in the registry |
+
+Vendors come from the system IEEE registry (`/usr/share/hwdata/oui.txt`, ~40k
+entries) when present, else a small built-in list. Redaction never depends on
+the lookup: the device-specific half of the address is hidden either way.
 
 `--replay` paces playback from the recorded `ts` deltas and loops, so a capture
 looks live on the projector. Use it if the venue's RF is dead.

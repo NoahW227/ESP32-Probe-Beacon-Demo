@@ -55,8 +55,9 @@
   .count { color: var(--dim); font-size: .85rem; text-align: right;
            font-variant-numeric: tabular-nums; }
   .ch  { color: var(--dim); font-size: .85rem; text-align: right; }
-  .mac { color: #7dd3fc; }
-  .mac.rnd { color: #c084fc; }
+  .mac.vendor  { color: #7dd3fc; }   /* real hardware address, maker known  */
+  .mac.random  { color: #c084fc; }   /* randomized - no maker to name       */
+  .mac.unknown { color: #7dd3fc; opacity: .6; }  /* real, but OUI unresolved */
 
   #namedPanel { border-top: 2px solid var(--line); max-height: 34vh; }
   #named .row.watched { background: rgba(251,191,36,.13); }
@@ -135,7 +136,7 @@
 
     $('#probes .rows').innerHTML = d.probes.map(p => `
       <div class="row">
-        <span class="mac ${p.rnd ? 'rnd' : ''}">${esc(revealMacs ? p.mac : p.label)}</span>
+        <span class="mac ${p.kind}">${esc(revealMacs ? p.mac : p.label)}</span>
         <span class="ssid ${p.named ? '' : 'wildcard'}">${p.named ? esc(p.ssid) : '(any network)'}</span>
         <span class="count">${p.count > 1 ? p.count + '\u00d7' : ''}</span>
         <span class="rssi ${band(p.rssi)}">${p.rssi}</span>
