@@ -5,3 +5,5 @@
 /.embuild
 sdkconfig.defaults.esp32s3
 sdkconfig
+__pycache__/
+*.pyc

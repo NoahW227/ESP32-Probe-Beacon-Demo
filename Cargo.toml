@@ -1,9 +1,8 @@
 [package]
 name = "wardrive-fw"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-resolver = "2"
-rust-version = "1.82"
+rust-version = "1.88"
 
 [[bin]]
 name = "wardrive-fw"
@@ -11,19 +10,27 @@ harness = false
 
 [profile.release]
 opt-level = "s"
+lto = "fat"
+codegen-units = 1
 
 [profile.dev]
-debug = true
 opt-level = "z"
 
-[features]
-default = ["std", "esp-idf-svc/native"]
-std = ["esp-idf-svc/binstart", "esp-idf-svc/std"]
-
 [dependencies]
-log = "0.4"
-anyhow = "1"
-esp-idf-svc = { version = "0.52.1", default-features = false }
+# Bare-metal ESP32 stack. No ESP-IDF, no C toolchain.
+# esp-radio is the current successor to esp-wifi; esp-rtos provides the
+# scheduler it requires (esp-radio panics if none is running).
+esp-hal = { version = "1.1", features = ["esp32", "rt", "unstable"] }
+esp-radio = { version = "0.18", features = ["esp32", "wifi", "sniffer", "esp-alloc", "unstable"] }
+esp-rtos = { version = "0.3", features = ["esp32", "esp-radio", "esp-alloc"] }
+esp-alloc = "0.10"       # serde_json needs a heap
+# Supplies the ESP-IDF app descriptor espflash requires in the image header.
+esp-bootloader-esp-idf = { version = "0.5", features = ["esp32"] }
+esp-println = { version = "0.18", features = ["esp32"] }
+esp-backtrace = { version = "0.20", features = ["esp32", "panic-handler", "println"] }
 
-[build-dependencies]
-embuild = "0.33"
+ieee80211 = { version = "0.5.9", default-features = false }   # drops crypto + defmt
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+heapless = "0.9"
+critical-section = "1.2"

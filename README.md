@@ -1,104 +1,105 @@
 # wardrive-fw
 
 Passive 802.11 management-frame sniffer for the ESP32. Emits newline-delimited
-JSON on the USB serial console; the host program consumes it.
+JSON on the serial console; a host program consumes it.
+
+## Stack
+
+Bare-metal Rust — no ESP-IDF, no FreeRTOS, no C toolchain.
+
+| crate | role |
+| --- | --- |
+| `esp-hal` 1.1 | peripherals, timers, clocks |
+| `esp-radio` 0.18 | WiFi driver and promiscuous-mode sniffer |
+| `esp-rtos` 0.3 | scheduler (esp-radio panics without one) |
+| `ieee80211` | 802.11 frame and element parsing |
+| `serde` + `serde_json` | wire format |
+
+`esp-radio` supersedes `esp-wifi`, which now only builds against `esp-hal`
+1.0.0-rc.0 — it references a HAL feature renamed after that release.
+
+The firmware contains **no `unsafe`**.
 
 ## Why it's built this way
 
-**USB serial, not WiFi.** The radio can only listen to one channel at a time.
-Associating to an AP to ship data over the network would pin us to that AP's
-channel and kill channel hopping. Serial also means the demo doesn't depend on
-conference WiFi.
+**We never associate.** Association pins the radio to the AP's channel, which
+would kill channel hopping. That is also why the host link is serial rather
+than WiFi.
 
-**Beacons are aggregated on-device.** Every AP beacons about 10x/second. Twenty
-APs in range is ~200 frames/s of near-identical data. The firmware keeps a BSSID
-table and emits one row per AP per second, carrying the strongest RSSI seen in
-that window plus a lifetime frame count.
+**Beacons are aggregated on-device.** Every AP beacons ~10x/second; twenty APs
+is ~200 near-identical frames/second. The firmware keeps a BSSID table and
+emits one row per AP per second with the strongest RSSI in that window.
 
-**Named probe requests are never dropped.** Wildcard (empty-SSID) probes are the
-overwhelming bulk of client traffic and are individually uninteresting, so they
-are budgeted at 150/sec. A probe carrying an actual SSID bypasses the budget
-entirely — those are rare and are the point of the demo.
+**Named probe requests are never dropped.** Wildcard (empty-SSID) probes are
+the bulk of client traffic and are individually uninteresting, so they are
+budgeted at 150/sec. A probe carrying a real SSID bypasses the budget — those
+are rare and are the point.
 
-## Setup (once)
+## Setup
 
-    ./setup.sh          # system packages, python3.12 shim, Xtensa rust toolchain
-    source env.sh       # must be sourced in every new shell before building
-
-`setup.sh` installs python3.12 alongside the system Python. Fedora 44 ships only
-Python 3.14, which ESP-IDF 5.2 does not support; the shim in `.toolchain/pybin`
-puts a supported interpreter first on PATH at build time without disturbing the
-system default.
+    ./setup.sh        # Espressif Rust toolchain (Xtensa is not upstream)
+    source env.sh     # in every new shell
 
 ## Build and flash
 
     source env.sh
     cargo build --release
-    cargo run --release          # flashes and opens the monitor
+    cargo run --release      # flash + monitor
 
-To just watch the stream:
-
-    espflash monitor --monitor-baud 921600
+Incremental rebuilds are ~3 seconds.
 
 ## This board
 
-**Classic ESP32, not an ESP32-S3** — the chip identified itself as `esp32
-(revision v3.1)`, WiFi+BT, 4MB flash, MAC `d4:e9:f4:89:52:90`. It enumerates as
-`/dev/ttyUSB0` through a CH340/CP210x bridge. The ESP32 has no native USB
-peripheral, so UART0 is the only console path.
+Classic **ESP32** (`esp32 rev v3.1`, WiFi+BT, 4 MB flash), not an ESP32-S3. It
+enumerates as `/dev/ttyUSB0` via a CH340/CP210x bridge; the ESP32 has no native
+USB, so UART0 is the only console.
 
-To retarget to an actual S3 later, see the note at the top of
-`.cargo/config.toml`; both toolchain targets are installed and `main.rs` needs
-no changes (the promiscuous API is identical).
+Console runs at the bootloader default **115200**. Measured load is ~41% of
+that. To retarget an actual S3, change `target` and `MCU` in
+`.cargo/config.toml`; `main.rs` needs no changes.
 
-### Baud: 921600
+**Flash at the default baud.** This CH340 fails at 460800 with `Timeout while
+running ReadReg command`. Flashing baud is unrelated to console baud.
 
-    espflash monitor --monitor-baud 921600
-
-`cargo run --release` passes this automatically.
-
-Getting a non-default baud to stick takes more than setting it. ESP-IDF
-declares the symbol as:
-
-    prompt "UART console baud rate" if ESP_CONSOLE_UART_CUSTOM
-
-so under the ordinary `ESP_CONSOLE_UART_DEFAULT` console choice it has **no
-prompt**, is not user-settable, and any value in `sdkconfig.defaults` is
-silently discarded in favour of 115200 — with no warning. `sdkconfig.defaults`
-therefore selects `ESP_CONSOLE_UART_CUSTOM` and restates UART0's normal pins.
-Same physical port; the only difference is that the rate now applies.
-
-Verify it took, rather than trusting the file:
-
-    grep CONFIG_ESP_CONSOLE_UART_BAUDRATE \
-      target/xtensa-esp32-espidf/release/build/esp-idf-sys-*/out/sdkconfig
-
-**Flashing baud is separate from console baud.** This CH340 fails flashing at
-460800 (`Timeout while running ReadReg command`), so flash at the default and
-leave `--baud` alone. Runtime output at 921600 is unaffected and measures 96%
-clean.
-
-Expect a few garbage bytes at the very start of each boot: the ROM bootloader
-talks before the console config applies. The host skips any line not starting
-with `{`, so this is cosmetic.
-
-### Capturing a stream by hand
+## Capturing a stream by hand
 
 Serial settings revert when the last handle on the port closes, so `stty`
-followed by a separate `cat` races and produces corrupt data. Hold the fd open
-across both:
+followed by a separate `cat` races and yields corrupt data. Hold the fd open:
 
     exec 3<>/dev/ttyUSB0
-    stty -F /dev/ttyUSB0 921600 raw -echo -echoe -echok -crtscts -ixon
+    stty -F /dev/ttyUSB0 115200 raw -echo -echoe -echok -crtscts -ixon
     timeout 30 cat <&3 > capture.jsonl
     exec 3>&-
 
+## Host display
+
+    ./host/host.py                                    # live from the board
+    ./host/host.py --replay captures/demo-fallback.jsonl
+    ./host/host.py --watch "Smith Family WiFi"        # pin a planted SSID
+
+Then open <http://127.0.0.1:8000/>.
+
+Standard library only — no pip, no sudo. We never write to the serial port, so
+after `termios` sets the line discipline it reads as a plain file, which is why
+`pyserial` isn't needed.
+
+Layout: access points by signal strength (the room's own AP sorts to the top),
+probe requests as a live feed, and a pinned panel of the network names devices
+are asking for. That last panel is the point of the demo and never scrolls, so
+a rare named probe can't vanish mid-sentence.
+
+Keys: `M` reveals full MACs, `+`/`-` resize for the projector.
+
+MACs are redacted by default to `Vendor:hash` (`Apple:3e6a`), or `(random):…`
+when the locally-administered bit is set. Unknown OUIs show the bare prefix, so
+nothing depends on the vendor table being complete.
+
+`--replay` paces playback from the recorded `ts` deltas and loops, so a capture
+looks live on the projector. Use it if the venue's RF is dead.
+
 ## Output schema (schema: 1)
 
-One JSON object per line. Lines not starting with `{` are IDF log output and
-should be skipped by the host.
-
-    {"t":"meta","fw":"wardrive-fw 0.1","band":"2.4GHz","schema":1}
+One JSON object per line; skip anything not starting with `{`.
 
     {"t":"beacon","ts":12345,"bssid":"aa:bb:cc:dd:ee:ff","ssid":"CoffeeShop",
      "hidden":false,"rssi":-42,"ch":6,"sec":"WPA2","count":377}
@@ -112,46 +113,20 @@ should be skipped by the host.
     {"t":"stat","ts":12345,"frames":48213,"queue_drops":0,
      "probe_suppressed":12,"aps":37,"heap":198432}
 
-Field notes:
-
-- `ts` — milliseconds since boot, not wall clock. Host applies its own clock.
-- `rssi` — dBm, higher (closer to 0) is stronger. For beacons this is the
-  strongest sample in the flush window.
-- `ch` — taken from the AP's DS Parameter Set tag when present, which is more
-  trustworthy than the channel we happened to receive on.
-- `sec` — `OPEN` / `WEP` / `WPA` / `WPA2` / `WPA3`. WPA3 is detected by the SAE
-  AKM suite in the RSN element.
-- `named` — false means a wildcard probe (no SSID). Expect most probes from
-  modern phones to be wildcards.
-- `rnd` — the locally-administered bit is set, i.e. the device is using a
-  randomized MAC. This is the visible evidence of a phone trying not to be
-  tracked, and is worth putting on screen.
-- `hidden` — the beacon carried no SSID. A later `probe_resp` may reveal it,
-  and the firmware backfills the name when that happens.
-- `queue_drops` — non-zero means the main task isn't draining the callback
-  queue fast enough. Should stay at 0; if it doesn't, raise the serial rate or
-  tighten the probe budget.
+- `ts` — milliseconds since boot, not wall clock.
+- `rssi` — dBm; for beacons, the strongest sample in the flush window.
+- `ch` — from the AP's DS Parameter Set when present, which is more reliable
+  than the channel we happened to receive on.
+- `sec` — `OPEN`/`WEP`/`WPA`/`WPA2`/`WPA3`. WPA3 is detected by the SAE AKM
+  suite in the RSN element.
+- `named` — false means a wildcard probe. Most probes from modern phones are.
+- `rnd` — locally-administered bit set, i.e. a randomized MAC.
+- `ssid` — `<non-utf8>` marks a name that is not valid UTF-8, which would
+  otherwise be indistinguishable from a hidden network.
+- `queue_drops` — should stay 0; non-zero means the main loop isn't draining
+  the sniffer queue fast enough.
 
 ## Channel plan
 
-Full sweep is 2700 ms: 400 ms each on 1/6/11 (where most APs live), 150 ms on
-the rest. Regulatory domain is set to manual 1–13 so the hopper can reach 12/13.
-The firmware only ever receives; it never transmits.
-
-## Measured behaviour
-
-From a 30 s live capture on this hardware (32-34 APs in range):
-
-    parsed=710  malformed=0
-    beacon 340 | probe_resp 277 | probe_req 78 | stat 14
-    queue_drops=0   heap stable across all stat lines
-    throughput ~2.9 KB/s  (~3% of the 921600 link)
-
-`malformed=0` across hundreds of records means the SSID escaping holds against
-real-world names. `queue_drops=0` means the callback -> main-task handoff keeps
-up. Headroom at 921600 is roughly 30x measured load, so the wildcard-probe
-budget should never engage outside a very dense room.
-
-Named probe requests do occur here at roughly 1.6/second — higher than
-expected. Note they are campus SSIDs (`eduroam`, `UMASS`) rather than home
-networks, and essentially all come from randomized MACs (`rnd:true`).
+Full sweep 2.7 s: 400 ms each on 1/6/11 (where most APs live), 150 ms on the
+rest. Receive only; the firmware never transmits.

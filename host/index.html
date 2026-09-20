@@ -1,0 +1,155 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wardrive</title>
+<style>
+  :root {
+    --scale: 1;
+    --bg: #0b0e14; --panel: #121722; --line: #212838;
+    --fg: #d7dce5; --dim: #6b7688; --accent: #4ade80;
+    --warn: #fbbf24; --hot: #f87171;
+    font-size: calc(17px * var(--scale));
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 1.5rem; flex-wrap: wrap;
+    padding: .6rem 1rem; border-bottom: 2px solid var(--line); background: var(--panel);
+  }
+  h1 { margin: 0; font-size: 1.15rem; letter-spacing: .18em; }
+  .mode { font-weight: 700; }
+  .mode.live { color: var(--accent); }
+  .mode.replay { color: var(--warn); }
+  .mode.stale { color: var(--hot); }
+  .counters { margin-left: auto; display: flex; gap: 1.4rem; color: var(--dim); }
+  .counters b { color: var(--fg); font-weight: 700; }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 2px; min-height: 0; }
+  section { background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+  h2 {
+    margin: 0; padding: .45rem 1rem; font-size: .82rem; letter-spacing: .16em;
+    color: var(--dim); border-bottom: 1px solid var(--line); text-transform: uppercase;
+  }
+  .rows { flex: 1; overflow: hidden; padding: .3rem 0;
+          display: flex; flex-direction: column; justify-content: space-evenly; }
+  .row {
+    display: grid; align-items: baseline; gap: .9rem;
+    padding: .15rem 1rem; white-space: nowrap;
+  }
+  #namedPanel .rows { justify-content: flex-start; }
+  #beacons .row { grid-template-columns: 4.2rem minmax(0,1fr) 4.5rem 3.5rem; }
+  #probes  .row { grid-template-columns: 11rem 1fr 4.2rem; }
+  #named   .row { grid-template-columns: 1fr 9rem 14rem; }
+  .rssi { text-align: right; font-variant-numeric: tabular-nums; }
+  .s0 { color: var(--accent); } .s1 { color: #a3e635; }
+  .s2 { color: var(--warn); }   .s3 { color: var(--dim); }
+  .ssid { overflow: hidden; text-overflow: ellipsis; }
+  .hidden-ap, .wildcard { color: var(--dim); font-style: italic; }
+  .sec { color: var(--dim); font-size: .85rem; }
+  .ch  { color: var(--dim); font-size: .85rem; text-align: right; }
+  .mac { color: #7dd3fc; }
+  .mac.rnd { color: #c084fc; }
+
+  #namedPanel { border-top: 2px solid var(--line); max-height: 34vh; }
+  #named .row.watched { background: rgba(251,191,36,.13); }
+  #named .name { color: var(--warn); font-weight: 700; }
+  .meta { color: var(--dim); font-size: .85rem; text-align: right; }
+  .empty { padding: .7rem 1rem; color: var(--dim); font-style: italic; }
+  footer { padding: .3rem 1rem; color: var(--dim); font-size: .75rem; background: var(--panel); }
+</style>
+
+<header>
+  <h1>WARDRIVE</h1>
+  <span id="mode" class="mode">connecting…</span>
+  <div class="counters">
+    <span>APs <b id="c-aps">0</b></span>
+    <span>Devices <b id="c-dev">0</b></span>
+    <span>Leaked SSIDs <b id="c-named">0</b></span>
+    <span>Frames/s <b id="c-fps">0</b></span>
+  </div>
+</header>
+
+<main>
+  <section id="beacons">
+    <h2>Access points &mdash; by signal strength</h2>
+    <div class="rows"></div>
+  </section>
+  <section id="probes">
+    <h2>Probe requests &mdash; live</h2>
+    <div class="rows"></div>
+  </section>
+</main>
+
+<section id="namedPanel">
+  <h2>Networks devices are asking for &mdash; these names are being broadcast</h2>
+  <div id="named" class="rows"></div>
+</section>
+
+<footer>M reveal MACs &nbsp;·&nbsp; +/&minus; size &nbsp;·&nbsp; <span id="uptime">0s</span></footer>
+
+<script>
+  let revealMacs = false, scale = 1;
+  const $ = s => document.querySelector(s);
+
+  addEventListener('keydown', e => {
+    if (e.key === 'm' || e.key === 'M') revealMacs = !revealMacs;
+    else if (e.key === '+' || e.key === '=') scale = Math.min(scale + 0.1, 2.5);
+    else if (e.key === '-') scale = Math.max(scale - 0.1, 0.6);
+    else return;
+    document.documentElement.style.setProperty('--scale', scale);
+  });
+
+  // Signal buckets, so the room's own AP reads as obviously strongest.
+  const band = r => r >= -50 ? 's0' : r >= -67 ? 's1' : r >= -80 ? 's2' : 's3';
+  const esc = s => String(s).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  function render(d) {
+    const m = $('#mode');
+    m.textContent = d.stale ? '● NO DATA' : (d.mode === 'live' ? '● LIVE' : '● REPLAY');
+    m.className = 'mode ' + (d.stale ? 'stale' : d.mode);
+
+    const c = d.counters;
+    $('#c-aps').textContent = c.aps;
+    $('#c-dev').textContent = c.devices;
+    $('#c-named').textContent = c.named_ssids;
+    $('#c-fps').textContent = c.fps;
+    $('#uptime').textContent = c.uptime + 's  ·  drops ' + c.drops +
+      '  ·  suppressed ' + c.suppressed + '  ·  heap ' + c.heap;
+
+    $('#beacons .rows').innerHTML = d.beacons.map(b => `
+      <div class="row">
+        <span class="rssi ${band(b.rssi)}">${b.rssi}</span>
+        <span class="ssid ${b.hidden ? 'hidden-ap' : ''}">${b.hidden ? '&lt;hidden&gt;' : esc(b.ssid)}</span>
+        <span class="sec">${esc(b.sec)}</span>
+        <span class="ch">ch${b.ch}</span>
+      </div>`).join('') || '<div class="empty">waiting for beacons…</div>';
+
+    $('#probes .rows').innerHTML = d.probes.map(p => `
+      <div class="row">
+        <span class="mac ${p.rnd ? 'rnd' : ''}">${esc(revealMacs ? p.mac : p.label)}</span>
+        <span class="ssid ${p.named ? '' : 'wildcard'}">${p.named ? esc(p.ssid) : '(any network)'}</span>
+        <span class="rssi ${band(p.rssi)}">${p.rssi}</span>
+      </div>`).join('') || '<div class="empty">waiting for probes…</div>';
+
+    $('#named').innerHTML = d.named.map(n => `
+      <div class="row ${n.watched ? 'watched' : ''}">
+        <span class="name ssid">${esc(n.ssid)}</span>
+        <span class="meta">${n.devices} device${n.devices === 1 ? '' : 's'}</span>
+        <span class="meta">seen ${n.count}×, best ${n.best_rssi} dBm</span>
+      </div>`).join('') ||
+      '<div class="empty">no named probe requests yet — most modern phones send wildcard probes</div>';
+  }
+
+  // Paint once from /state before the first SSE tick, so the projector never
+  // shows an empty grid while waiting.
+  fetch('/state').then(r => r.json()).then(render).catch(() => {});
+
+  const es = new EventSource('/events');
+  es.onmessage = e => render(JSON.parse(e.data));
+  es.onerror = () => { $('#mode').textContent = '● DISCONNECTED'; $('#mode').className = 'mode stale'; };
+</script>

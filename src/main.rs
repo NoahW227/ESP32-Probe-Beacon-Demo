@@ -1,62 +1,61 @@
-//! Passive 802.11 management-frame sniffer for ESP32-S3.
+#![no_std]
+#![no_main]
+
+//! Passive 802.11 sniffer for the ESP32. Hops the 2.4 GHz channels and emits
+//! newline-delimited JSON on UART0 at 115200 baud.
 //!
-//! Listens in promiscuous mode, hops 2.4 GHz channels, parses beacons and
-//! probe requests/responses, and emits one JSON object per line on stdout.
+//! Two constraints shape the design:
 //!
-//! Design notes that matter:
-//!
-//! * We come up in STA mode but never call `connect()`. Being *associated*
-//!   would pin the radio to the AP's channel and kill channel hopping, which
-//!   is also why the host link is USB serial rather than WiFi.
-//! * The promiscuous RX callback runs on the WiFi driver task. It must not
-//!   block or allocate, so it parses each frame into a fixed-size POD record
-//!   and drops it into a FreeRTOS queue. All formatting, aggregation and I/O
-//!   happens on the main task.
-//! * Beacons are aggregated on-device (one update per BSSID per second)
-//!   because every AP beacons ~10x/second and forwarding all of that would
-//!   swamp the serial link with redundant rows.
+//! * We never associate — that would pin the radio to one channel and kill
+//!   channel hopping. It is also why the host link is serial, not WiFi.
+//! * The sniffer callback runs on the WiFi task, so it copies what it needs
+//!   into a queue and returns. Formatting happens in `main`.
 
-use core::ffi::c_void;
-use core::mem::size_of;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
-use std::collections::HashMap;
-use std::io::Write;
+extern crate alloc;
 
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sys::*;
-use esp_idf_svc::wifi::{ClientConfiguration, Configuration, WifiDriver};
+// espflash refuses an image without an ESP-IDF app descriptor in its header.
+esp_bootloader_esp_idf::esp_app_desc!();
 
-// ---------------------------------------------------------------------------
-// Tunables
-// ---------------------------------------------------------------------------
+use alloc::collections::BTreeMap;
+use core::{
+    cell::RefCell,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
-/// Depth of the callback -> main-task handoff queue.
-const QUEUE_DEPTH: u32 = 384;
+use critical_section::Mutex;
+use esp_backtrace as _;
+use esp_hal::{
+    clock::CpuClock, interrupt::software::SoftwareInterruptControl, main, time::Instant,
+    timer::timg::TimerGroup,
+};
+use esp_println::println;
+use esp_radio::wifi::{
+    sniffer::PromiscuousPkt, sta::StationConfig, Config, ControllerConfig, SecondaryChannel,
+};
+use heapless::{Deque, String as HString};
+use ieee80211::{
+    elements::{
+        rsn::{IEEE80211AkmType, RsnElement},
+        DSSSParameterSetElement, ReadElements, SSIDElement,
+    },
+    match_frames,
+    mgmt_frame::{BeaconFrame, ProbeRequestFrame, ProbeResponseFrame},
+};
+use serde::Serialize;
 
-/// How often aggregated beacon rows are flushed to the host.
+// --- Tunables ---
+
+const QUEUE_DEPTH: usize = 128;
 const BEACON_FLUSH_MS: u64 = 1000;
-
-/// Forget an AP we haven't heard from in this long.
+const STAT_INTERVAL_MS: u64 = 2000;
 const AP_STALE_MS: u64 = 300_000;
 
-/// Safety valve: max *wildcard* probe requests emitted per second. Named
-/// probes (the ones carrying a real SSID) always bypass this - they are the
-/// rare, interesting ones and must never be dropped.
-const WILDCARD_PROBE_BUDGET: u32 = 150;
+/// Max wildcard probes emitted per second. Named probes bypass this — they are
+/// rare and are the whole point.
+const WILDCARD_BUDGET: u32 = 150;
 
-/// How long the main loop blocks waiting on the frame queue.
-///
-/// `portTICK_PERIOD_MS` is a C macro, so bindgen never emits it; derive the
-/// tick count from the real `configTICK_RATE_HZ` binding instead so this stays
-/// correct if the tick rate in sdkconfig.defaults ever changes.
-const QUEUE_WAIT_TICKS: u32 = 50 * configTICK_RATE_HZ / 1000;
-
-/// Channel dwell schedule. 1/6/11 are the non-overlapping channels where most
-/// APs actually live, so they get a longer dwell; the rest get a quick look so
-/// we still catch probe requests sprayed across the band.
-/// Full sweep = 3*400 + 10*150 = 2700 ms.
+/// 1/6/11 carry most APs so they get a longer dwell; the rest get a quick look
+/// to catch probes sprayed across the band. Full sweep 2.7 s.
 const HOP_PLAN: [(u8, u64); 13] = [
     (1, 400),
     (2, 150),
@@ -73,609 +72,430 @@ const HOP_PLAN: [(u8, u64); 13] = [
     (13, 150),
 ];
 
-// ---------------------------------------------------------------------------
-// 802.11 layout constants
-// ---------------------------------------------------------------------------
+// --- Shared state ---
 
-const MGMT_HDR_LEN: usize = 24;
-/// Timestamp(8) + beacon interval(2) + capability(2) after the header.
-const FIXED_PARAMS_LEN: usize = 12;
-const FCS_LEN: usize = 4;
-
-const SUBTYPE_PROBE_REQ: u8 = 4;
-const SUBTYPE_PROBE_RESP: u8 = 5;
-const SUBTYPE_BEACON: u8 = 8;
-
-const TAG_SSID: u8 = 0;
-const TAG_DS_PARAMS: u8 = 3;
-const TAG_RSN: u8 = 48;
-const TAG_VENDOR: u8 = 221;
-
-const CAP_PRIVACY: u16 = 0x0010;
-
-// Record kinds, mirrored on the host.
-const KIND_BEACON: u8 = 0;
-const KIND_PROBE_REQ: u8 = 1;
-const KIND_PROBE_RESP: u8 = 2;
-
-// Security classes.
-const SEC_OPEN: u8 = 0;
-const SEC_WEP: u8 = 1;
-const SEC_WPA: u8 = 2;
-const SEC_WPA2: u8 = 3;
-const SEC_WPA3: u8 = 4;
-
-// ---------------------------------------------------------------------------
-// Shared state
-// ---------------------------------------------------------------------------
-
-static QUEUE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
-/// Frames the callback accepted.
-static FRAMES: AtomicU32 = AtomicU32::new(0);
-/// Frames the callback had to throw away because the queue was full. Non-zero
-/// here means the main task isn't draining fast enough.
+static QUEUE: Mutex<RefCell<Deque<Frame, QUEUE_DEPTH>>> =
+    Mutex::new(RefCell::new(Deque::new()));
+static SEEN: AtomicU32 = AtomicU32::new(0);
 static DROPS: AtomicU32 = AtomicU32::new(0);
 
-/// Fixed-size, `Copy` record passed through the FreeRTOS queue. No pointers,
-/// no heap - it is memcpy'd by value into and out of the queue.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RawRec {
-    kind: u8,
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Beacon,
+    ProbeReq,
+    ProbeResp,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Sec {
+    Open,
+    Wep,
+    Wpa,
+    Wpa2,
+    Wpa3,
+}
+
+impl Sec {
+    fn as_str(self) -> &'static str {
+        match self {
+            Sec::Open => "OPEN",
+            Sec::Wep => "WEP",
+            Sec::Wpa => "WPA",
+            Sec::Wpa2 => "WPA2",
+            Sec::Wpa3 => "WPA3",
+        }
+    }
+}
+
+/// Owned copy of one frame: `ieee80211` parses zero-copy against the driver's
+/// buffer, which dies when the callback returns.
+#[derive(Clone)]
+struct Frame {
+    kind: Kind,
     rssi: i8,
     channel: u8,
-    sec: u8,
-    ssid_len: u8,
-    /// addr2 - the transmitter. For a probe request this is the client.
     src: [u8; 6],
-    /// addr3 - the BSSID.
     bssid: [u8; 6],
-    ssid: [u8; 32],
+    ssid: HString<32>,
+    /// False for a hidden AP or a wildcard probe.
+    has_ssid: bool,
+    sec: Sec,
 }
 
-impl RawRec {
-    const fn zeroed() -> Self {
-        Self {
-            kind: 0,
-            rssi: 0,
-            channel: 0,
-            sec: 0,
-            ssid_len: 0,
-            src: [0; 6],
-            bssid: [0; 6],
-            ssid: [0; 32],
-        }
-    }
+// --- JSON — serde derives the whole wire format ---
 
-    fn ssid(&self) -> &[u8] {
-        &self.ssid[..self.ssid_len as usize]
-    }
+#[derive(Serialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+enum Event<'a> {
+    Beacon {
+        ts: u64,
+        bssid: Mac,
+        ssid: &'a str,
+        hidden: bool,
+        rssi: i8,
+        ch: u8,
+        sec: &'static str,
+        count: u32,
+    },
+    ProbeReq {
+        ts: u64,
+        mac: Mac,
+        ssid: &'a str,
+        named: bool,
+        rssi: i8,
+        ch: u8,
+        rnd: bool,
+    },
+    ProbeResp {
+        ts: u64,
+        bssid: Mac,
+        ssid: &'a str,
+        rssi: i8,
+        ch: u8,
+        sec: &'static str,
+    },
+    Stat {
+        ts: u64,
+        frames: u32,
+        queue_drops: u32,
+        probe_suppressed: u32,
+        aps: usize,
+        heap: usize,
+    },
 }
 
-// ---------------------------------------------------------------------------
-// Promiscuous RX callback  (runs on the WiFi task - keep it cheap)
-// ---------------------------------------------------------------------------
+/// Serializes as `aa:bb:cc:dd:ee:ff` without allocating.
+struct Mac([u8; 6]);
 
-unsafe extern "C" fn rx_cb(buf: *mut c_void, pkt_type: wifi_promiscuous_pkt_type_t) {
-    if pkt_type != wifi_promiscuous_pkt_type_t_WIFI_PKT_MGMT || buf.is_null() {
-        return;
-    }
-
-    let pkt = &*(buf as *const wifi_promiscuous_pkt_t);
-
-    // sig_len includes the 4-byte FCS, which is not part of the MPDU we parse.
-    let sig_len = pkt.rx_ctrl.sig_len() as usize;
-    if sig_len < MGMT_HDR_LEN + FCS_LEN {
-        return;
-    }
-    let len = sig_len - FCS_LEN;
-    let body = core::slice::from_raw_parts(pkt.payload.as_ptr(), len);
-
-    let fc0 = body[0];
-    // Type 0 == management. Anything else shouldn't reach us given the filter.
-    if (fc0 >> 2) & 0x03 != 0 {
-        return;
-    }
-    let subtype = (fc0 >> 4) & 0x0F;
-
-    let (kind, tag_start) = match subtype {
-        SUBTYPE_BEACON => (KIND_BEACON, MGMT_HDR_LEN + FIXED_PARAMS_LEN),
-        SUBTYPE_PROBE_RESP => (KIND_PROBE_RESP, MGMT_HDR_LEN + FIXED_PARAMS_LEN),
-        // A probe request has no fixed parameters; tags start right after the
-        // header.
-        SUBTYPE_PROBE_REQ => (KIND_PROBE_REQ, MGMT_HDR_LEN),
-        _ => return,
-    };
-    if len < tag_start {
-        return;
-    }
-
-    let mut rec = RawRec::zeroed();
-    rec.kind = kind;
-    rec.rssi = pkt.rx_ctrl.rssi() as i8;
-    rec.channel = pkt.rx_ctrl.channel() as u8;
-    rec.src.copy_from_slice(&body[10..16]);
-    rec.bssid.copy_from_slice(&body[16..22]);
-
-    // Capability bits only exist on beacons and probe responses.
-    let privacy = if kind == KIND_PROBE_REQ {
-        false
-    } else {
-        let cap = u16::from_le_bytes([body[34], body[35]]);
-        cap & CAP_PRIVACY != 0
-    };
-
-    let mut has_rsn = false;
-    let mut has_sae = false;
-    let mut has_wpa = false;
-
-    // Walk the tagged parameters.
-    let mut i = tag_start;
-    while i + 2 <= len {
-        let id = body[i];
-        let tlen = body[i + 1] as usize;
-        let start = i + 2;
-        let end = start + tlen;
-        if end > len {
-            break; // truncated / malformed - stop rather than read past the end
-        }
-        let data = &body[start..end];
-
-        match id {
-            TAG_SSID => {
-                let n = tlen.min(32);
-                rec.ssid[..n].copy_from_slice(&data[..n]);
-                rec.ssid_len = n as u8;
+impl Serialize for Mac {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut buf = [0u8; 17];
+        for (i, b) in self.0.iter().enumerate() {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            buf[i * 3] = HEX[(b >> 4) as usize];
+            buf[i * 3 + 1] = HEX[(b & 0xf) as usize];
+            if i < 5 {
+                buf[i * 3 + 2] = b':';
             }
-            TAG_DS_PARAMS => {
-                // The AP's declared channel is more trustworthy than the
-                // channel we happened to receive on (adjacent-channel bleed).
-                if tlen >= 1 && data[0] >= 1 && data[0] <= 14 {
-                    rec.channel = data[0];
-                }
-            }
-            TAG_RSN => {
-                has_rsn = true;
-                if rsn_has_sae(data) {
-                    has_sae = true;
-                }
-            }
-            TAG_VENDOR => {
-                // Old-style WPA1 IE: OUI 00:50:F2, type 1.
-                if tlen >= 4 && data[..4] == [0x00, 0x50, 0xf2, 0x01] {
-                    has_wpa = true;
-                }
-            }
-            _ => {}
         }
-        i = end;
-    }
-
-    rec.sec = if has_sae {
-        SEC_WPA3
-    } else if has_rsn {
-        SEC_WPA2
-    } else if has_wpa {
-        SEC_WPA
-    } else if privacy {
-        SEC_WEP
-    } else {
-        SEC_OPEN
-    };
-
-    // An SSID that is all NUL bytes is a hidden network advertising a
-    // zero-filled placeholder; treat it as hidden (empty).
-    if rec.ssid_len > 0 && rec.ssid[..rec.ssid_len as usize].iter().all(|&b| b == 0) {
-        rec.ssid_len = 0;
-    }
-
-    let q = QUEUE.load(Ordering::Relaxed);
-    if q.is_null() {
-        return;
-    }
-    // Non-blocking send; on a full queue we drop and count rather than stall
-    // the WiFi task.
-    let ok = xQueueGenericSend(
-        q as QueueHandle_t,
-        &rec as *const RawRec as *const c_void,
-        0,
-        0, // queueSEND_TO_BACK
-    );
-    if ok == 1 {
-        FRAMES.fetch_add(1, Ordering::Relaxed);
-    } else {
-        DROPS.fetch_add(1, Ordering::Relaxed);
+        s.serialize_str(core::str::from_utf8(&buf).unwrap_or("??"))
     }
 }
 
-/// Look for the SAE AKM suite (00-0F-AC:8) inside an RSN information element,
-/// which is what distinguishes WPA3 from WPA2.
-fn rsn_has_sae(data: &[u8]) -> bool {
-    // version(2) group cipher(4) pairwise_count(2) pairwise[4*n]
-    //   akm_count(2) akm[4*n]
-    if data.len() < 8 {
-        return false;
-    }
-    let pair_count = u16::from_le_bytes([data[6], data[7]]) as usize;
-    let akm_count_off = 8 + pair_count * 4;
-    if akm_count_off + 2 > data.len() {
-        return false;
-    }
-    let akm_count =
-        u16::from_le_bytes([data[akm_count_off], data[akm_count_off + 1]]) as usize;
-    let akm_off = akm_count_off + 2;
-    for k in 0..akm_count {
-        let o = akm_off + k * 4;
-        if o + 4 > data.len() {
-            break;
-        }
-        // 00-0F-AC:8 = SAE, :9 = FT-SAE
-        if data[o..o + 3] == [0x00, 0x0f, 0xac] && (data[o + 3] == 8 || data[o + 3] == 9) {
-            return true;
-        }
-    }
-    false
-}
-
-// ---------------------------------------------------------------------------
-// Host-facing JSON
-// ---------------------------------------------------------------------------
-
-fn now_ms() -> u64 {
-    (unsafe { esp_timer_get_time() } as u64) / 1000
-}
-
-fn push_mac(out: &mut String, mac: &[u8; 6]) {
-    out.push('"');
-    for (i, b) in mac.iter().enumerate() {
-        if i > 0 {
-            out.push(':');
-        }
-        out.push_str(&format!("{:02x}", b));
-    }
-    out.push('"');
-}
-
-/// SSIDs are arbitrary attacker-controlled bytes: not necessarily UTF-8, and
-/// free to contain quotes, backslashes and control characters. Escape
-/// rigorously or one hostile beacon breaks the host's line parser.
-fn push_str_escaped(out: &mut String, raw: &[u8]) {
-    out.push('"');
-    for c in String::from_utf8_lossy(raw).chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
-fn sec_name(sec: u8) -> &'static str {
-    match sec {
-        SEC_WEP => "WEP",
-        SEC_WPA => "WPA",
-        SEC_WPA2 => "WPA2",
-        SEC_WPA3 => "WPA3",
-        _ => "OPEN",
+fn emit(ev: &Event<'_>) {
+    if let Ok(s) = serde_json::to_string(ev) {
+        println!("{}", s);
     }
 }
 
-/// A locally-administered unicast address (bit 1 of the first octet) is the
-/// signature of MAC randomization - i.e. a phone deliberately hiding its real
-/// hardware address. This is worth surfacing: it is the visible evidence that
-/// the device is trying not to be tracked.
+/// A locally-administered address means the device is randomizing its MAC.
 fn is_randomized(mac: &[u8; 6]) -> bool {
     mac[0] & 0x02 != 0
 }
 
-// ---------------------------------------------------------------------------
-// Beacon aggregation
-// ---------------------------------------------------------------------------
+// --- Frame parsing ---
 
+/// `ieee80211` validates SSIDs as UTF-8, so without checking the raw element a
+/// non-UTF-8 name would look identical to a hidden network.
+fn read_ssid(elements: ReadElements<'_>) -> (HString<32>, bool) {
+    let mut out = HString::new();
+    match elements.get_first_element::<SSIDElement>() {
+        Some(el) if !el.ssid().is_empty() => {
+            let _ = out.push_str(el.ssid());
+            (out, true)
+        }
+        // Element parsed as absent/empty; if raw bytes exist it is non-UTF-8.
+        _ => match elements.get_first_element_raw(ieee80211::elements::ElementID::Id(0)) {
+            Some(raw) if !raw.slice.is_empty() => {
+                let _ = out.push_str("<non-utf8>");
+                (out, true)
+            }
+            _ => (out, false),
+        },
+    }
+}
+
+fn read_channel(elements: ReadElements<'_>, fallback: u8) -> u8 {
+    elements
+        .get_first_element::<DSSSParameterSetElement>()
+        .map(|d| d.current_channel)
+        .filter(|c| (1..=14).contains(c))
+        .unwrap_or(fallback)
+}
+
+/// WPA3 is distinguished from WPA2 by the SAE AKM suite in the RSN element.
+fn read_security(elements: ReadElements<'_>, privacy: bool) -> Sec {
+    if let Some(rsn) = elements.get_first_element::<RsnElement>() {
+        let sae = rsn.akm_list.into_iter().flatten().any(|akm| {
+            matches!(
+                akm,
+                IEEE80211AkmType::Sae | IEEE80211AkmType::FTUsingSae
+            )
+        });
+        return if sae { Sec::Wpa3 } else { Sec::Wpa2 };
+    }
+    // Legacy WPA1 advertises itself in a vendor element: OUI 00:50:F2, type 1.
+    let wpa1 = elements
+        .get_matching_elements_raw(ieee80211::elements::ElementID::Id(221))
+        .any(|e| e.slice.starts_with(&[0x00, 0x50, 0xf2, 0x01]));
+    match (wpa1, privacy) {
+        (true, _) => Sec::Wpa,
+        (false, true) => Sec::Wep,
+        (false, false) => Sec::Open,
+    }
+}
+
+fn push(frame: Frame) {
+    critical_section::with(|cs| {
+        let mut q = QUEUE.borrow_ref_mut(cs);
+        if q.push_back(frame).is_err() {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SEEN.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Runs on the WiFi task. Keep it short: parse, copy, enqueue.
+fn sniff(pkt: PromiscuousPkt<'_>) {
+    let rssi = pkt.rx_cntl.rssi as i8;
+    let rx_ch = pkt.rx_cntl.channel as u8;
+
+    // Trim the trailing FCS. (match_frames! has a `with_fcs:` arm, but it
+    // parses ambiguously against its own `$binding:pat` fragment.)
+    let Some(body) = pkt.data.get(..pkt.data.len().saturating_sub(4)) else {
+        return;
+    };
+
+    let _ = match_frames! { body,
+        beacon = BeaconFrame => {
+            let el = beacon.elements;
+            let (ssid, has_ssid) = read_ssid(el);
+            push(Frame {
+                kind: Kind::Beacon,
+                rssi,
+                channel: read_channel(el, rx_ch),
+                src: *beacon.header.transmitter_address,
+                bssid: *beacon.header.bssid,
+                ssid,
+                has_ssid,
+                sec: read_security(el, beacon.body.capabilities_info.is_confidentiality_required()),
+            });
+        }
+        probe = ProbeRequestFrame => {
+            let el = probe.elements;
+            let (ssid, has_ssid) = read_ssid(el);
+            push(Frame {
+                kind: Kind::ProbeReq,
+                rssi,
+                channel: rx_ch,
+                src: *probe.header.transmitter_address,
+                bssid: *probe.header.bssid,
+                ssid,
+                has_ssid,
+                sec: Sec::Open,
+            });
+        }
+        resp = ProbeResponseFrame => {
+            let el = resp.elements;
+            let (ssid, has_ssid) = read_ssid(el);
+            push(Frame {
+                kind: Kind::ProbeResp,
+                rssi,
+                channel: read_channel(el, rx_ch),
+                src: *resp.header.transmitter_address,
+                bssid: *resp.header.bssid,
+                ssid,
+                has_ssid,
+                sec: read_security(el, resp.body.capabilities_info.is_confidentiality_required()),
+            });
+        }
+    };
+}
+
+// --- Beacon aggregation ---
+
+/// Every AP beacons ~10x/second, so collapse to one row per BSSID per second
+/// carrying the strongest RSSI in that window.
 struct Ap {
-    ssid: [u8; 32],
-    ssid_len: u8,
-    sec: u8,
+    ssid: HString<32>,
+    has_ssid: bool,
+    sec: Sec,
     channel: u8,
-    /// Strongest RSSI seen since the last flush.
     rssi_best: i8,
-    /// Total beacons heard from this BSSID since boot.
     count: u32,
-    last_seen_ms: u64,
+    last_seen: u64,
     dirty: bool,
 }
 
-fn main() -> anyhow::Result<()> {
-    esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+fn now_ms() -> u64 {
+    Instant::now().duration_since_epoch().as_millis()
+}
 
-    // Our JSON shares stdout with the IDF log; keep the log quiet.
-    unsafe {
-        esp_log_level_set(b"*\0".as_ptr() as *const _, esp_log_level_t_ESP_LOG_WARN);
-    }
+#[main]
+fn main() -> ! {
+    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 
-    let peripherals = Peripherals::take()?;
-    let sysloop = EspSystemEventLoop::take()?;
-    let nvs = EspDefaultNvsPartition::take()?;
+    // esp-radio requires a running scheduler.
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw.software_interrupt0);
 
-    // Create the handoff queue before the callback can ever fire.
-    let q = unsafe { xQueueGenericCreate(QUEUE_DEPTH, size_of::<RawRec>() as u32, 0) };
-    if q.is_null() {
-        anyhow::bail!("failed to allocate frame queue");
-    }
-    QUEUE.store(q as *mut c_void, Ordering::SeqCst);
+    let (mut controller, mut interfaces) =
+        esp_radio::wifi::new(peripherals.WIFI, ControllerConfig::default()).expect("wifi new");
 
-    // Bring the radio up in STA mode but never connect: association would lock
-    // us to one channel.
-    let mut wifi = WifiDriver::new(peripherals.modem, sysloop, Some(nvs))?;
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
+    // Station mode but we never connect — association would lock us to one
+    // channel. set_config is also what starts the radio.
+    controller
+        .set_config(&Config::Station(StationConfig::default()))
+        .expect("set config");
 
-    unsafe {
-        // Manual country policy covering channels 1-13 so the hopper can reach
-        // 12 and 13. We only ever receive, never transmit.
-        let mut country = wifi_country_t {
-            cc: [0; 3],
-            schan: 1,
-            nchan: 13,
-            max_tx_power: 20,
-            policy: wifi_country_policy_t_WIFI_COUNTRY_POLICY_MANUAL,
-        };
-        let cc = *b"JP\0";
-        country.cc = cc.map(|b| b as _);
-        esp!(esp_wifi_set_country(&country))?;
-    }
+    interfaces.sniffer.set_receive_cb(sniff);
+    interfaces
+        .sniffer
+        .set_promiscuous_mode(true)
+        .expect("promiscuous");
 
-    wifi.start()?;
+    println!(r#"{{"t":"meta","fw":"wardrive-fw 0.2","band":"2.4GHz","schema":1}}"#);
 
-    unsafe {
-        // Power save would have the radio nap through frames we want.
-        esp!(esp_wifi_set_ps(wifi_ps_type_t_WIFI_PS_NONE))?;
-
-        let filter = wifi_promiscuous_filter_t {
-            filter_mask: WIFI_PROMIS_FILTER_MASK_MGMT,
-        };
-        esp!(esp_wifi_set_promiscuous_filter(&filter))?;
-        esp!(esp_wifi_set_promiscuous_rx_cb(Some(rx_cb)))?;
-        esp!(esp_wifi_set_promiscuous(true))?;
-    }
-
-    // Channel hopper.
-    std::thread::Builder::new()
-        .stack_size(4096)
-        .name("hopper".into())
-        .spawn(|| loop {
-            for (ch, dwell) in HOP_PLAN {
-                unsafe {
-                    // Ignore failures: some channels may be rejected depending
-                    // on the regulatory state, and that shouldn't stop the sweep.
-                    esp_wifi_set_channel(ch, wifi_second_chan_t_WIFI_SECOND_CHAN_NONE);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(dwell));
-            }
-        })?;
-
-    let mut out = String::with_capacity(8192);
-    let mut stdout = std::io::stdout();
-
-    // Announce ourselves so the host can confirm the link is live and knows
-    // what schema to expect.
-    out.push_str("{\"t\":\"meta\",\"fw\":\"wardrive-fw 0.1\",\"band\":\"2.4GHz\",\"schema\":1}\n");
-
-    let mut aps: HashMap<[u8; 6], Ap> = HashMap::new();
-    let mut rec = RawRec::zeroed();
-
-    let mut last_flush = now_ms();
-    let mut last_stat = now_ms();
-    let mut probe_window_start = now_ms();
-    let mut wildcards_this_window: u32 = 0;
-    let mut wildcards_suppressed: u32 = 0;
+    let mut aps: BTreeMap<[u8; 6], Ap> = BTreeMap::new();
+    let mut hop = 0usize;
+    let mut hop_due = now_ms();
+    let mut flush_due = now_ms() + BEACON_FLUSH_MS;
+    let mut stat_due = now_ms() + STAT_INTERVAL_MS;
+    let mut window_start = now_ms();
+    let mut wildcards = 0u32;
+    let mut suppressed = 0u32;
 
     loop {
-        // Drain whatever the callback has queued. 50 ms block keeps us
-        // responsive without spinning.
-        let got = unsafe {
-            xQueueReceive(
-                q,
-                &mut rec as *mut RawRec as *mut c_void,
-                QUEUE_WAIT_TICKS,
-            )
-        };
-
-        if got == 1 {
-            loop {
-                handle(
-                    &rec,
-                    &mut aps,
-                    &mut out,
-                    &mut wildcards_this_window,
-                    &mut wildcards_suppressed,
-                );
-                let more = unsafe {
-                    xQueueReceive(q, &mut rec as *mut RawRec as *mut c_void, 0)
-                };
-                if more != 1 {
-                    break;
-                }
-            }
-        }
-
         let now = now_ms();
 
-        // Reset the wildcard-probe budget once per second.
-        if now.saturating_sub(probe_window_start) >= 1000 {
-            probe_window_start = now;
-            wildcards_this_window = 0;
+        // Channel hop.
+        if now >= hop_due {
+            let (ch, dwell) = HOP_PLAN[hop];
+            let _ = controller.set_channel(ch, SecondaryChannel::None);
+            hop = (hop + 1) % HOP_PLAN.len();
+            hop_due = now + dwell;
         }
 
-        // Flush aggregated beacon rows.
-        if now.saturating_sub(last_flush) >= BEACON_FLUSH_MS {
-            last_flush = now;
+        // Drain whatever the sniffer queued.
+        while let Some(frame) = critical_section::with(|cs| QUEUE.borrow_ref_mut(cs).pop_front()) {
+            handle(frame, now, &mut aps, &mut wildcards, &mut suppressed);
+        }
+
+        if now.saturating_sub(window_start) >= 1000 {
+            window_start = now;
+            wildcards = 0;
+        }
+
+        if now >= flush_due {
+            flush_due = now + BEACON_FLUSH_MS;
             for (bssid, ap) in aps.iter_mut() {
                 if !ap.dirty {
                     continue;
                 }
-                emit_beacon(&mut out, bssid, ap, now);
+                emit(&Event::Beacon {
+                    ts: now,
+                    bssid: Mac(*bssid),
+                    ssid: ap.ssid.as_str(),
+                    hidden: !ap.has_ssid,
+                    rssi: ap.rssi_best,
+                    ch: ap.channel,
+                    sec: ap.sec.as_str(),
+                    count: ap.count,
+                });
                 ap.dirty = false;
                 ap.rssi_best = i8::MIN;
             }
-            aps.retain(|_, ap| now.saturating_sub(ap.last_seen_ms) < AP_STALE_MS);
+            aps.retain(|_, ap| now.saturating_sub(ap.last_seen) < AP_STALE_MS);
         }
 
-        // Heartbeat / health line.
-        if now.saturating_sub(last_stat) >= 2000 {
-            last_stat = now;
-            out.push_str("{\"t\":\"stat\",\"ts\":");
-            out.push_str(&now.to_string());
-            out.push_str(",\"frames\":");
-            out.push_str(&FRAMES.load(Ordering::Relaxed).to_string());
-            out.push_str(",\"queue_drops\":");
-            out.push_str(&DROPS.load(Ordering::Relaxed).to_string());
-            out.push_str(",\"probe_suppressed\":");
-            out.push_str(&wildcards_suppressed.to_string());
-            out.push_str(",\"aps\":");
-            out.push_str(&aps.len().to_string());
-            out.push_str(",\"heap\":");
-            out.push_str(&unsafe { esp_get_free_heap_size() }.to_string());
-            out.push_str("}\n");
-        }
-
-        if !out.is_empty() {
-            let _ = stdout.write_all(out.as_bytes());
-            let _ = stdout.flush();
-            out.clear();
+        if now >= stat_due {
+            stat_due = now + STAT_INTERVAL_MS;
+            emit(&Event::Stat {
+                ts: now,
+                frames: SEEN.load(Ordering::Relaxed),
+                queue_drops: DROPS.load(Ordering::Relaxed),
+                probe_suppressed: suppressed,
+                aps: aps.len(),
+                heap: esp_alloc::HEAP.free(),
+            });
         }
     }
 }
 
 fn handle(
-    rec: &RawRec,
-    aps: &mut HashMap<[u8; 6], Ap>,
-    out: &mut String,
-    wildcards_this_window: &mut u32,
-    wildcards_suppressed: &mut u32,
+    f: Frame,
+    now: u64,
+    aps: &mut BTreeMap<[u8; 6], Ap>,
+    wildcards: &mut u32,
+    suppressed: &mut u32,
 ) {
-    let now = now_ms();
-
-    match rec.kind {
-        KIND_BEACON => {
-            let entry = aps.entry(rec.bssid).or_insert_with(|| {
-                Ap {
-                    ssid: rec.ssid,
-                    ssid_len: rec.ssid_len,
-                    sec: rec.sec,
-                    channel: rec.channel,
-                    rssi_best: i8::MIN,
-                    count: 0,
-                    last_seen_ms: now,
-                    // Emit a brand-new AP on the next flush rather than
-                    // waiting a full cycle.
-                    dirty: true,
-                }
+    match f.kind {
+        Kind::Beacon => {
+            let ap = aps.entry(f.bssid).or_insert_with(|| Ap {
+                ssid: HString::new(),
+                has_ssid: false,
+                sec: f.sec,
+                channel: f.channel,
+                rssi_best: i8::MIN,
+                count: 0,
+                last_seen: now,
+                dirty: true,
             });
-
-            entry.count = entry.count.saturating_add(1);
-            entry.last_seen_ms = now;
-            entry.channel = rec.channel;
-            entry.sec = rec.sec;
-            entry.dirty = true;
-            if rec.rssi > entry.rssi_best {
-                entry.rssi_best = rec.rssi;
-            }
-            // A hidden AP's beacon carries no SSID, but its probe response
-            // might - so never overwrite a known name with an empty one.
-            if rec.ssid_len > 0 {
-                entry.ssid = rec.ssid;
-                entry.ssid_len = rec.ssid_len;
+            ap.count = ap.count.saturating_add(1);
+            ap.last_seen = now;
+            ap.channel = f.channel;
+            ap.sec = f.sec;
+            ap.rssi_best = ap.rssi_best.max(f.rssi);
+            ap.dirty = true;
+            // Never overwrite a known name with a hidden AP's empty one.
+            if f.has_ssid {
+                ap.ssid = f.ssid;
+                ap.has_ssid = true;
             }
         }
 
-        KIND_PROBE_REQ => {
-            let named = rec.ssid_len > 0;
-            if !named {
-                // Wildcard probes are the bulk of the traffic and each one is
-                // individually uninteresting; budget them.
-                if *wildcards_this_window >= WILDCARD_PROBE_BUDGET {
-                    *wildcards_suppressed = wildcards_suppressed.saturating_add(1);
+        Kind::ProbeReq => {
+            // Wildcard probes are the bulk of traffic; named ones always pass.
+            if !f.has_ssid {
+                if *wildcards >= WILDCARD_BUDGET {
+                    *suppressed = suppressed.saturating_add(1);
                     return;
                 }
-                *wildcards_this_window += 1;
+                *wildcards += 1;
             }
-
-            out.push_str("{\"t\":\"probe_req\",\"ts\":");
-            out.push_str(&now.to_string());
-            out.push_str(",\"mac\":");
-            push_mac(out, &rec.src);
-            out.push_str(",\"ssid\":");
-            push_str_escaped(out, rec.ssid());
-            out.push_str(",\"named\":");
-            out.push_str(if named { "true" } else { "false" });
-            out.push_str(",\"rssi\":");
-            out.push_str(&rec.rssi.to_string());
-            out.push_str(",\"ch\":");
-            out.push_str(&rec.channel.to_string());
-            out.push_str(",\"rnd\":");
-            out.push_str(if is_randomized(&rec.src) { "true" } else { "false" });
-            out.push_str("}\n");
+            emit(&Event::ProbeReq {
+                ts: now,
+                mac: Mac(f.src),
+                ssid: f.ssid.as_str(),
+                named: f.has_ssid,
+                rssi: f.rssi,
+                ch: f.channel,
+                rnd: is_randomized(&f.src),
+            });
         }
 
-        KIND_PROBE_RESP => {
-            // Useful because a probe response reveals the SSID of an AP whose
-            // beacons are cloaked.
-            out.push_str("{\"t\":\"probe_resp\",\"ts\":");
-            out.push_str(&now.to_string());
-            out.push_str(",\"bssid\":");
-            push_mac(out, &rec.bssid);
-            out.push_str(",\"ssid\":");
-            push_str_escaped(out, rec.ssid());
-            out.push_str(",\"rssi\":");
-            out.push_str(&rec.rssi.to_string());
-            out.push_str(",\"ch\":");
-            out.push_str(&rec.channel.to_string());
-            out.push_str(",\"sec\":\"");
-            out.push_str(sec_name(rec.sec));
-            out.push_str("\"}\n");
-
-            // Let a probe response fill in a hidden AP's name.
-            if rec.ssid_len > 0 {
-                if let Some(ap) = aps.get_mut(&rec.bssid) {
-                    if ap.ssid_len == 0 {
-                        ap.ssid = rec.ssid;
-                        ap.ssid_len = rec.ssid_len;
+        Kind::ProbeResp => {
+            emit(&Event::ProbeResp {
+                ts: now,
+                bssid: Mac(f.bssid),
+                ssid: f.ssid.as_str(),
+                rssi: f.rssi,
+                ch: f.channel,
+                sec: f.sec.as_str(),
+            });
+            // A probe response can reveal a cloaked AP's name.
+            if f.has_ssid {
+                if let Some(ap) = aps.get_mut(&f.bssid) {
+                    if !ap.has_ssid {
+                        ap.ssid = f.ssid;
+                        ap.has_ssid = true;
                         ap.dirty = true;
                     }
                 }
             }
         }
-
-        _ => {}
     }
-}
-
-fn emit_beacon(out: &mut String, bssid: &[u8; 6], ap: &Ap, now: u64) {
-    out.push_str("{\"t\":\"beacon\",\"ts\":");
-    out.push_str(&now.to_string());
-    out.push_str(",\"bssid\":");
-    push_mac(out, bssid);
-    out.push_str(",\"ssid\":");
-    push_str_escaped(out, &ap.ssid[..ap.ssid_len as usize]);
-    out.push_str(",\"hidden\":");
-    out.push_str(if ap.ssid_len == 0 { "true" } else { "false" });
-    out.push_str(",\"rssi\":");
-    // rssi_best is reset to i8::MIN after each flush; if we somehow emit
-    // without a sample, send a floor value the host can filter.
-    out.push_str(&if ap.rssi_best == i8::MIN { -100 } else { ap.rssi_best }.to_string());
-    out.push_str(",\"ch\":");
-    out.push_str(&ap.channel.to_string());
-    out.push_str(",\"sec\":\"");
-    out.push_str(sec_name(ap.sec));
-    out.push_str("\",\"count\":");
-    out.push_str(&ap.count.to_string());
-    out.push_str("}\n");
 }
