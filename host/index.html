@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>:: WarDrive 2000 :: 802.11 Packet Sniffer ::</title>
+<title>:: 802.11 Packet Sniffer ::</title>
 <style>
   :root { --scale: 1; }
   body {
@@ -98,15 +98,17 @@
   </div>
 
   <div id="banner">
-    <marquee scrollamount="4">
-      *** WELCOME TO WARDRIVE 2000 *** YOUR WIRELESS DEVICE IS BROADCASTING RIGHT NOW ***
-      NO SOFTWARE REQUIRED *** 100&#37; PASSIVE *** SIGINT DEMONSTRATION ***
+    <marquee scrollamount="5" scrolldelay="-5">
+      BEACON MESSAGES ARE HOW ROUTERS ADVERTISE THEIR NETWORKS 
+      ----    ANY DEVICE IN WIFI RANGE CAN RECIEVE AND SEE THE NAME OR SSID OF THE NETWORK 
+      ----    DEVICES MAY BROADCAST PROBE REQUESTS CONTAINING THE SSID OF NETWORKS THEY'VE CONNECTED TO BEFORE 
+      ----    ANY LISTENER IN WIFI RANGE OF THOSE DEVICES MAY LEARN WHAT NETWORKS THEY CONNECT TO
     </marquee>
   </div>
 
   <div id="cols">
     <div class="panel">
-      <h3>&#128246; ACCESS POINTS -- strongest signal first</h3>
+      <h3>&#128246; ACCESS POINTS: identified from Beacon Messages</h3>
       <table>
         <thead><tr>
           <th class="num">Signal</th><th>Network</th><th>Security</th><th class="num">Ch</th>
@@ -116,7 +118,7 @@
     </div>
 
     <div class="panel">
-      <h3 id="probeHead">&#128241; PROBE REQUESTS</h3>
+      <h3 id="probeHead">&#128241; DEVICES: identified from Probe Requests</h3>
       <table>
         <thead><tr>
           <th>Device</th><th>Looking for</th><th class="num">Seen</th><th class="num">Signal</th>
@@ -128,7 +130,7 @@
 
   <div style="padding:0 6px 6px">
     <div class="panel">
-      <h3>&#9888; NETWORKS DEVICES ARE ASKING FOR -- these names are being broadcast
+      <h3>&#9888; NETWORKS from device probe requests:
           <span class="blink">&lt;NEW!&gt;</span></h3>
       <table>
         <thead><tr>
@@ -156,7 +158,7 @@
 <div id="footer">
   Best viewed at 1024x768 &nbsp;|&nbsp; <span class="badge">Valid HTML 4.01</span>
   &nbsp;|&nbsp; Press <b>M</b> to reveal MACs, <b>+</b>/<b>-</b> to resize
-  &nbsp;|&nbsp; &copy; 2005 WarDrive Industries
+  &nbsp;|&nbsp; &copy; 2005 Wardriver Industries
 </div>
 
 <script>
@@ -180,9 +182,6 @@
     $('#mode').textContent = d.stale ? 'NO DATA' : (d.mode === 'live' ? 'LIVE CAPTURE' : 'REPLAY');
     $('#statusText').textContent = d.stale
       ? 'Warning: no data received' : 'Done -- receiving packets...';
-
-    $('#probeHead').innerHTML = '&#128241; PROBE REQUESTS -- ' +
-      (d.sort === 'count' ? 'most requests first' : 'strongest signal first');
 
     const c = d.counters;
     $('#c-aps').textContent = odo(c.aps);
