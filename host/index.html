@@ -35,7 +35,16 @@
   }
   .blink { animation: blink 1s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
-  marquee { color: #cc0000; font-weight: bold; }
+  #ticker { overflow: hidden; white-space: nowrap; }
+  .track {
+    display: flex; width: max-content;
+    animation: ticker var(--ticker-speed, 34s) linear infinite;
+  }
+  .seg { color: #cc0000; font-weight: bold; padding-right: 4rem; }
+  /* Two identical segments, so -50% is exactly one segment: seamless. */
+  @keyframes ticker { from { transform: translateX(0); }
+                        to { transform: translateX(-50%); } }
+  @media (prefers-reduced-motion: reduce) { .track { animation: none; } }
 
   /* ---- panels ---- */
   #cols { display: flex; gap: 6px; padding: 6px; align-items: flex-start; }
@@ -98,12 +107,12 @@
   </div>
 
   <div id="banner">
-    <marquee scrollamount="5" scrolldelay="-5">
-      BEACON MESSAGES ARE HOW ROUTERS ADVERTISE THEIR NETWORKS 
+    <div id="ticker"><div class="track"><span class="seg">
+BEACON MESSAGES ARE HOW ROUTERS ADVERTISE THEIR NETWORKS 
       ----    ANY DEVICE IN WIFI RANGE CAN RECIEVE AND SEE THE NAME OR SSID OF THE NETWORK 
       ----    DEVICES MAY BROADCAST PROBE REQUESTS CONTAINING THE SSID OF NETWORKS THEY'VE CONNECTED TO BEFORE 
       ----    ANY LISTENER IN WIFI RANGE OF THOSE DEVICES MAY LEARN WHAT NETWORKS THEY CONNECT TO
-    </marquee>
+    </span></div></div>
   </div>
 
   <div id="cols">
@@ -162,6 +171,13 @@
 </div>
 
 <script>
+  // The seamless loop needs two copies of the banner; clone it instead of
+  // duplicating the text in the markup, so there is still one place to edit.
+  {
+    const seg = document.querySelector('.seg');
+    if (seg) seg.parentNode.appendChild(seg.cloneNode(true));
+  }
+
   let revealMacs = false, scale = 1;
   const $ = s => document.querySelector(s);
 
